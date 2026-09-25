@@ -5,6 +5,7 @@ import os
 import random
 import re
 import sqlite3
+import time
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -55,6 +56,7 @@ USE_POSTGRES = bool(DATABASE_URL)
 if USE_POSTGRES:
     import psycopg2
     import psycopg2.extras
+    import psycopg2.pool
 
 # По запросу: путь к базе данных (для файлового режима SQLite) теперь можно
 # переопределить переменной окружения DB_PATH (например, чтобы хранить файл
@@ -249,7 +251,12 @@ class _PGCursor:
 
 class _PGConn:
     """Обёртка над соединением psycopg2, повторяющая нужный код бота API
-    sqlite3.Connection: execute(...), cursor(), commit(), close()."""
+    sqlite3.Connection: execute(...), cursor(), commit(), close().
+
+    ВАЖНО: connection здесь не "своё", а взято из общего пула (_pg_pool).
+    close() поэтому не закрывает TCP-соединение, а возвращает его в пул —
+    открывать новое соединение (TCP+TLS-хэндшейк) на каждый чих было главной
+    причиной тормозов бота (пара секунд на апдейт вместо миллисекунд)."""
 
     def __init__(self, pg_conn):
         self._conn = pg_conn
@@ -268,12 +275,32 @@ class _PGConn:
         self._conn.commit()
 
     def close(self):
-        self._conn.close()
+        try:
+            # если в соединении осталась незакоммиченная/сорвавшаяся
+            # транзакция — откатываем перед возвратом в пул, иначе следующий
+            # код, который его получит, unexpectedly словит чужую ошибку
+            self._conn.rollback()
+        except Exception:
+            pass
+        try:
+            _pg_pool.putconn(self._conn)
+        except Exception:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+
+_pg_pool = None
+if USE_POSTGRES:
+    # minconn=1, maxconn=20 — с запасом для параллельных апдейтов aiogram;
+    # соединения переиспользуются, а не создаются заново на каждый запрос.
+    _pg_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
 
 
 def db():
     if USE_POSTGRES:
-        pg_conn = psycopg2.connect(DATABASE_URL)
+        pg_conn = _pg_pool.getconn()
         return _PGConn(pg_conn)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -1640,7 +1667,27 @@ async def cmd_help(message: Message):
     await reply_or_send(message, text)
 
 
-@dp.message(Command("profile"))
+@dp.message(Command("ping"))
+async def cmd_ping(message: Message):
+    """Показывает задержку между получением сообщения от Telegram и ответом
+    бота, плюс отдельно — сколько занимает простой запрос к базе. Полезно,
+    чтобы отличить "тормозит сеть/Telegram" от "тормозит база данных"."""
+    t0 = time.monotonic()
+    db_ms = None
+    try:
+        conn = db()
+        conn.execute("SELECT 1")
+        conn.close()
+        db_ms = round((time.monotonic() - t0) * 1000)
+    except Exception as e:
+        log.warning("Ping: запрос к БД не удался: %s", e)
+
+    reply_ms = round((datetime.utcnow() - message.date.replace(tzinfo=None)).total_seconds() * 1000)
+
+    lines = [f"🏓 Понг!", f"База данных: {db_ms} мс" if db_ms is not None else "База данных: ❌ ошибка"]
+    if reply_ms >= 0:
+        lines.append(f"Доставка сообщения: ~{reply_ms} мс")
+    await reply_or_send(message, "\n".join(lines))
 @dp.message(F.text.func(lambda t: _normalize_ru(t) in {"профиль", "стая"} if t else False))
 async def cmd_profile(message: Message):
     u = message.from_user
