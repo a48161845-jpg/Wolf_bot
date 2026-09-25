@@ -667,7 +667,7 @@ def add_potion(user_id: int, potion_type: str, delta: int):
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO potions (user_id, potion_type, count) VALUES (?,?,?) "
-        "ON CONFLICT(user_id, potion_type) DO UPDATE SET count = count + excluded.count",
+        "ON CONFLICT(user_id, potion_type) DO UPDATE SET count = potions.count + excluded.count",
         (user_id, potion_type, delta),
     )
     conn.commit()
@@ -4639,6 +4639,22 @@ async def handle_pending_text(message: Message):
 # =========================================================
 #  ЗАПУСК
 # =========================================================
+
+@dp.errors()
+async def global_error_handler(event):
+    """Ловит ЛЮБОЕ необработанное исключение в хендлерах и печатает полный
+    traceback в лог. Раньше такого перехватчика не было — если хендлер падал
+    с исключением, которое aiogram по каким-то причинам не логировал сам,
+    бот просто "молчал" на сообщение без единой строки в логе, и понять,
+    что вообще пошло не так, было невозможно."""
+    log.error(
+        "Необработанная ошибка при обработке апдейта %s: %s",
+        event.update.update_id if event.update else "?",
+        event.exception,
+        exc_info=True,
+    )
+    return True
+
 
 async def main():
     init_db()
