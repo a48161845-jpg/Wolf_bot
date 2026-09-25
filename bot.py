@@ -289,7 +289,7 @@ def init_db():
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             username TEXT,
             display_name TEXT,
             registered_at TEXT,
@@ -318,7 +318,7 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS pets (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             name TEXT,
             alive INTEGER DEFAULT 0,
             level INTEGER DEFAULT 1,
@@ -343,7 +343,7 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS quests (
-            user_id INTEGER,
+            user_id BIGINT,
             quest_id TEXT,
             period_start TEXT,
             progress REAL DEFAULT 0,
@@ -353,14 +353,14 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS daily_quests (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             quest_ids TEXT,
             assigned_at TEXT
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS admins (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             added_at TEXT,
             added_by INTEGER
         )
@@ -368,7 +368,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             order_id {orders_pk_type},
-            user_id INTEGER,
+            user_id BIGINT,
             username TEXT,
             display_name TEXT,
             product TEXT,
@@ -380,7 +380,7 @@ def init_db():
     """.format(orders_pk_type="SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"))
     cur.execute("""
         CREATE TABLE IF NOT EXISTS owned_skins (
-            user_id INTEGER,
+            user_id BIGINT,
             skin_name TEXT,
             PRIMARY KEY (user_id, skin_name)
         )
@@ -398,7 +398,7 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS marriage_action_cooldowns (
-            user_id INTEGER,
+            user_id BIGINT,
             action_id TEXT,
             available_at TEXT,
             PRIMARY KEY (user_id, action_id)
@@ -406,7 +406,7 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS potions (
-            user_id INTEGER,
+            user_id BIGINT,
             potion_type TEXT,
             count INTEGER DEFAULT 0,
             PRIMARY KEY (user_id, potion_type)
@@ -414,15 +414,15 @@ def init_db():
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS message_owners (
-            chat_id INTEGER,
+            chat_id BIGINT,
             message_id INTEGER,
-            owner_id INTEGER,
+            owner_id BIGINT,
             PRIMARY KEY (chat_id, message_id)
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS known_chats (
-            chat_id INTEGER PRIMARY KEY,
+            chat_id BIGINT PRIMARY KEY,
             chat_type TEXT,
             title TEXT,
             last_seen TEXT
