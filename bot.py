@@ -392,7 +392,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS custom_skins (
             name TEXT PRIMARY KEY,
             sticker_id TEXT,
-            created_by INTEGER,
+            created_by BIGINT,
             created_at TEXT
         )
     """)
@@ -480,12 +480,12 @@ def _migrate_columns(conn: sqlite3.Connection):
     """Добавляет недостающие колонки в уже существующую базу (без потери данных)."""
     wanted = {
         "users": {
-            "spouse_id": "INTEGER",
+            "spouse_id": "BIGINT",
             "maze_active": "INTEGER DEFAULT 0",
             "maze_progress": "INTEGER DEFAULT 0",
             "maze_mistakes": "INTEGER DEFAULT 0",
             "maze_correct": "TEXT",
-            "pending_marriage_from": "INTEGER",
+            "pending_marriage_from": "BIGINT",
             "marriage_xp": "INTEGER DEFAULT 0",
             "marriage_level": "INTEGER DEFAULT 1",
             "pending_msg_id": "INTEGER",
@@ -494,7 +494,7 @@ def _migrate_columns(conn: sqlite3.Connection):
         },
         "pets": {
             "skin": "TEXT DEFAULT 'Wolf'",
-            "fight_opponent_id": "INTEGER",
+            "fight_opponent_id": "BIGINT",
             "fight_is_attacker": "INTEGER DEFAULT 0",
             "joint_activity_bonus": "INTEGER DEFAULT 0",
             "in_arena": "INTEGER DEFAULT 0",
@@ -522,6 +522,57 @@ def _migrate_columns(conn: sqlite3.Connection):
         for col, decl in cols.items():
             if col not in existing:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+    conn.commit()
+    _migrate_bigint_columns(conn)
+
+
+# Колонки, которые хранят Telegram user_id/chat_id — раньше были объявлены как
+# INTEGER (4 байта в Postgres, максимум ~2.1 млрд), а такие id уже давно бывают
+# больше (супергруппы/каналы -100..., у части новых аккаунтов user_id тоже
+# перевалил за 2^31), из-за чего падало "integer out of range". Актуальная
+# схема уже создаётся с BIGINT, но CREATE TABLE IF NOT EXISTS не трогает базы,
+# созданные раньше со старой схемой, — поэтому докручиваем тип явно на старте.
+_BIGINT_COLUMNS = [
+    ("users", "user_id"),
+    ("users", "spouse_id"),
+    ("users", "pending_marriage_from"),
+    ("pets", "user_id"),
+    ("pets", "fight_opponent_id"),
+    ("quests", "user_id"),
+    ("daily_quests", "user_id"),
+    ("admins", "user_id"),
+    ("orders", "user_id"),
+    ("owned_skins", "user_id"),
+    ("custom_skins", "created_by"),
+    ("marriage_action_cooldowns", "user_id"),
+    ("potions", "user_id"),
+    ("message_owners", "chat_id"),
+    ("message_owners", "owner_id"),
+    ("known_chats", "chat_id"),
+]
+
+
+def _migrate_bigint_columns(conn):
+    """Приводит существующие INTEGER-колонки с Telegram id к BIGINT (только Postgres;
+    под SQLite тип — это просто affinity, там всё и так работало, поэтому там
+    ничего не делаем). Безопасно запускать повторно при каждом старте."""
+    if not USE_POSTGRES:
+        return
+    cur = conn.cursor()
+    for table, col in _BIGINT_COLUMNS:
+        try:
+            cur.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name=? AND column_name=?",
+                (table, col),
+            )
+            row = cur.fetchone()
+            if row and row["data_type"] == "integer":
+                cur.execute(f"ALTER TABLE {table} ALTER COLUMN {col} TYPE BIGINT")
+                conn.commit()
+        except Exception as e:
+            conn.rollback()  # иначе psycopg2 держит соединение в aborted-транзакции
+            log.warning("Не удалось привести %s.%s к BIGINT: %s", table, col, e)
     conn.commit()
 
 
