@@ -338,12 +338,12 @@ def init_db():
             pending_action TEXT,
             prefix_until TEXT,
             antitarget_until TEXT,
-            spouse_id INTEGER,
+            spouse_id BIGINT,
             maze_active INTEGER DEFAULT 0,
             maze_progress INTEGER DEFAULT 0,
             maze_mistakes INTEGER DEFAULT 0,
             maze_correct TEXT,
-            pending_marriage_from INTEGER,
+            pending_marriage_from BIGINT,
             marriage_xp INTEGER DEFAULT 0,
             marriage_level INTEGER DEFAULT 1,
             pending_msg_id INTEGER
@@ -368,7 +368,7 @@ def init_db():
             busy_activity TEXT,
             cooking_until TEXT,
             skin TEXT DEFAULT 'Wolf',
-            fight_opponent_id INTEGER,
+            fight_opponent_id BIGINT,
             fight_is_attacker INTEGER DEFAULT 0,
             joint_activity_bonus INTEGER DEFAULT 0,
             in_arena INTEGER DEFAULT 0
@@ -395,7 +395,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS admins (
             user_id BIGINT PRIMARY KEY,
             added_at TEXT,
-            added_by INTEGER
+            added_by BIGINT
         )
     """)
     cur.execute("""
@@ -407,7 +407,7 @@ def init_db():
             product TEXT,
             status TEXT DEFAULT 'pending',
             created_at TEXT,
-            taken_by INTEGER,
+            taken_by BIGINT,
             payload TEXT
         )
     """.format(orders_pk_type="SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"))
@@ -574,7 +574,9 @@ _BIGINT_COLUMNS = [
     ("quests", "user_id"),
     ("daily_quests", "user_id"),
     ("admins", "user_id"),
+    ("admins", "added_by"),
     ("orders", "user_id"),
+    ("orders", "taken_by"),
     ("owned_skins", "user_id"),
     ("custom_skins", "created_by"),
     ("marriage_action_cooldowns", "user_id"),
