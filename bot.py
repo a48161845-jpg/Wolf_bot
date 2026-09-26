@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -74,7 +75,12 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split("
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("wolf_bot")
 
-bot = Bot(token=BOT_TOKEN)
+# БАГФИКС (скорость запуска): раньше у Bot() не было явного таймаута запроса,
+# использовался дефолт aiogram (обычно 60 сек). Если Telegram/сеть подтормаживали,
+# один "зависший" запрос мог держать очередь до минуты — а при последовательной
+# обработке сотен накопившихся уведомлений на старте (см. background_loop) это
+# превращалось в очень долгий и заметный "затор" при запуске бота.
+bot = Bot(token=BOT_TOKEN, session=AiohttpSession(timeout=15))
 dp = Dispatcher()
 
 # =========================================================
@@ -4338,6 +4344,32 @@ async def background_loop():
         await check_starvation_deaths()
 
 
+# БАГФИКС (скорость запуска): раньше все накопившиеся уведомления (лес/охота/
+# костёр/голод) на старте бота обрабатывались строго последовательно, один
+# пользователь за другим — если бот был выключен долго и накопилось много
+# игроков, это превращалось в очень долгую очередь сетевых запросов, часть из
+# которых висла по таймауту (видно в логах: "Request timeout error"), и весь
+# процесс растягивался на минуты. Теперь такие пакеты обрабатываются
+# ограниченно-параллельно (до BG_CONCURRENCY задач одновременно) — это на
+# порядок быстрее, но не создаёт всплеск, который упёрся бы в лимиты Telegram
+# на частоту сообщений.
+BG_CONCURRENCY = 10
+_bg_semaphore = asyncio.Semaphore(BG_CONCURRENCY)
+
+
+async def _bg_run(coro):
+    async with _bg_semaphore:
+        try:
+            await coro
+        except Exception as e:
+            log.error("Фоновая задача упала с ошибкой: %s", e, exc_info=True)
+
+
+async def _bg_gather(coros: list):
+    if coros:
+        await asyncio.gather(*(_bg_run(c) for c in coros))
+
+
 async def resolve_finished_activities():
     conn = db()
     rows = conn.execute(
@@ -4346,6 +4378,7 @@ async def resolve_finished_activities():
     conn.close()
 
     now = datetime.utcnow()
+    tasks = []
     for pet in rows:
         until = datetime.fromisoformat(pet["busy_until"])
         if now < until:
@@ -4354,15 +4387,16 @@ async def resolve_finished_activities():
             # только запись атакующего запускает разрешение боя,
             # чтобы не обработать одну и ту же схватку дважды
             if pet["fight_is_attacker"]:
-                await resolve_wolf_fight(pet)
+                tasks.append(resolve_wolf_fight(pet))
             continue
         if pet["busy_activity"] == FIGHT_CHALLENGE_ACTIVITY:
             # вызов на бой не был принят вовремя — сгорает (обрабатываем один раз,
             # тоже по записи атакующего)
             if pet["fight_is_attacker"]:
-                await resolve_fight_challenge_timeout(pet)
+                tasks.append(resolve_fight_challenge_timeout(pet))
             continue
-        await resolve_activity(pet)
+        tasks.append(resolve_activity(pet))
+    await _bg_gather(tasks)
 
 
 async def resolve_activity(pet: sqlite3.Row):
@@ -4624,13 +4658,15 @@ async def resolve_stale_activity_games():
     conn.close()
 
     now = datetime.utcnow()
+    tasks = []
     for pet in rows:
         offered_at = pet["game_offered_at"]
         if not offered_at:
             continue
         if (now - datetime.fromisoformat(offered_at)).total_seconds() < GAME_TIMEOUT_SECONDS:
             continue
-        await _finalize_activity_result(pet, won=None)
+        tasks.append(_finalize_activity_result(pet, won=None))
+    await _bg_gather(tasks)
 
 
 async def resolve_finished_campfires():
@@ -4641,6 +4677,7 @@ async def resolve_finished_campfires():
     conn.close()
 
     now = datetime.utcnow()
+    tasks = []
     for pet in rows:
         until = datetime.fromisoformat(pet["cooking_until"])
         if now < until:
@@ -4648,13 +4685,18 @@ async def resolve_finished_campfires():
         output = random.randint(CAMPFIRE_MEAT_OUTPUT_MIN, CAMPFIRE_MEAT_OUTPUT_MAX)
         update_pet(pet["user_id"], cooked_meat=pet["cooked_meat"] + output, cooking_until=None)
         record_quest_progress(pet["user_id"], "cook_meat", output)
-        try:
-            await bot.send_message(
-                pet["user_id"],
-                f"🍖 Мясо на костре готово! Получено {output} порций готового мяса.",
-            )
-        except Exception as e:
-            log.warning("Не удалось уведомить пользователя %s: %s", pet["user_id"], e)
+        tasks.append(_notify_campfire_ready(pet["user_id"], output))
+    await _bg_gather(tasks)
+
+
+async def _notify_campfire_ready(user_id: int, output: int):
+    try:
+        await bot.send_message(
+            user_id,
+            f"🍖 Мясо на костре готово! Получено {output} порций готового мяса.",
+        )
+    except Exception as e:
+        log.warning("Не удалось уведомить пользователя %s: %s", user_id, e)
 
 
 async def check_starvation_deaths():
@@ -4665,6 +4707,7 @@ async def check_starvation_deaths():
     conn.close()
 
     now = datetime.utcnow()
+    tasks = []
     for pet in rows:
         if not pet["starved_since"]:
             update_pet(pet["user_id"], starved_since=now.isoformat())
@@ -4674,16 +4717,21 @@ async def check_starvation_deaths():
         if now - started < grace:
             continue
         update_pet(pet["user_id"], alive=0, busy_until=None, busy_activity=None)
-        try:
-            sent = await bot.send_message(
-                pet["user_id"],
-                f"Ваш питомец «{pet['name']}» погиб от голода... 💔\n"
-                f"Желаете воскресить его?\nСтоимость: {REVIVE_COST_RUNES} рун 🀄",
-                reply_markup=revive_kb(),
-            )
-            remember_owner(sent.chat.id, sent.message_id, pet["user_id"])
-        except Exception as e:
-            log.warning("Не удалось уведомить пользователя %s: %s", pet["user_id"], e)
+        tasks.append(_notify_starvation_death(pet["user_id"], pet["name"]))
+    await _bg_gather(tasks)
+
+
+async def _notify_starvation_death(user_id: int, pet_name: str):
+    try:
+        sent = await bot.send_message(
+            user_id,
+            f"Ваш питомец «{pet_name}» погиб от голода... 💔\n"
+            f"Желаете воскресить его?\nСтоимость: {REVIVE_COST_RUNES} рун 🀄",
+            reply_markup=revive_kb(),
+        )
+        remember_owner(sent.chat.id, sent.message_id, user_id)
+    except Exception as e:
+        log.warning("Не удалось уведомить пользователя %s: %s", user_id, e)
 
 
 # =========================================================
