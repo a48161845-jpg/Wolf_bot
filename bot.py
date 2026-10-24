@@ -1,10 +1,12 @@
 import asyncio
+import html
 import json
 import logging
 import os
 import random
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -19,6 +21,7 @@ from aiogram.types import (
     FSInputFile,
 )
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import InputMediaPhoto
 
 try:
     # CopyTextButton появился в aiogram 3.7+ (Bot API 7.6) — кнопка, которая
@@ -103,9 +106,7 @@ OWNER_CHECK_EXEMPT_PREFIXES = (
 )
 
 
-def remember_owner(chat_id: int, message_id: int, owner_id: int):
-    MESSAGE_OWNERS[(chat_id, message_id)] = owner_id
-    # сохраняем и в БД, чтобы владение сообщением не терялось при перезапуске бота
+def _persist_owner_sync(chat_id: int, message_id: int, owner_id: int):
     try:
         conn = db()
         conn.execute(
@@ -117,6 +118,26 @@ def remember_owner(chat_id: int, message_id: int, owner_id: int):
         conn.close()
     except Exception as e:
         log.warning("Не удалось сохранить владельца сообщения: %s", e)
+
+
+def _run_in_background(func, *args):
+    """ОПТИМИЗАЦИЯ (отклик): второстепенные записи в БД (владелец сообщения,
+    «чат виден») больше не задерживают ответ игроку — они уходят в пул потоков.
+    Если event loop недоступен (например, вызов из тестов/синхронного кода) —
+    просто выполняем сразу."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        func(*args)
+        return
+    loop.run_in_executor(None, func, *args)
+
+
+def remember_owner(chat_id: int, message_id: int, owner_id: int):
+    MESSAGE_OWNERS[(chat_id, message_id)] = owner_id
+    # сохраняем и в БД (чтобы владение не терялось при перезапуске бота),
+    # но уже не блокируя ответ: в памяти запись появляется мгновенно
+    _run_in_background(_persist_owner_sync, chat_id, message_id, owner_id)
 
 
 def _get_owner(chat_id: int, message_id: int) -> int | None:
@@ -179,28 +200,53 @@ async def _owner_allowed(callback: CallbackQuery) -> bool:
 dp.callback_query.filter(_owner_allowed)
 
 
+# ОПТИМИЗАЦИЯ (отклик): раньше на КАЖДОЕ сообщение в любом чате делался
+# INSERT…ON CONFLICT + commit прямо в обработчике (сетевой поход до БД на
+# каждую реплику в группе, даже не относящуюся к боту). Теперь чат пишется в БД
+# только при первой встрече и затем не чаще раза в KNOWN_CHAT_REFRESH_SEC,
+# причём в фоне.
+_KNOWN_CHATS_SEEN: dict[int, float] = {}
+KNOWN_CHAT_REFRESH_SEC = 6 * 3600
+
+
 @dp.message.outer_middleware()
 async def track_known_chats_middleware(handler, message: Message, data):
     """Запоминает каждый чат, где бот увидел хоть одно сообщение — нужно
     для команды рассылки во все чаты."""
     try:
-        record_known_chat(message.chat)
+        now = time.monotonic()
+        last = _KNOWN_CHATS_SEEN.get(message.chat.id)
+        if last is None or now - last > KNOWN_CHAT_REFRESH_SEC:
+            _KNOWN_CHATS_SEEN[message.chat.id] = now
+            chat = message.chat
+            _run_in_background(
+                record_known_chat_values, chat.id, chat.type,
+                chat.title or chat.full_name or chat.username or str(chat.id),
+            )
     except Exception as e:
         log.warning("Не удалось запомнить чат для рассылки: %s", e)
     return await handler(message, data)
 
 
+def record_known_chat_values(chat_id: int, chat_type: str, title: str):
+    try:
+        conn = db()
+        conn.execute(
+            "INSERT INTO known_chats (chat_id, chat_type, title, last_seen) VALUES (?,?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type, title=excluded.title, "
+            "last_seen=excluded.last_seen",
+            (chat_id, chat_type, title, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("Не удалось сохранить чат для рассылки: %s", e)
+
+
 def record_known_chat(chat):
-    conn = db()
-    conn.execute(
-        "INSERT INTO known_chats (chat_id, chat_type, title, last_seen) VALUES (?,?,?,?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET chat_type=excluded.chat_type, title=excluded.title, "
-        "last_seen=excluded.last_seen",
-        (chat.id, chat.type, chat.title or chat.full_name or chat.username or str(chat.id),
-         datetime.utcnow().isoformat()),
+    record_known_chat_values(
+        chat.id, chat.type, chat.title or chat.full_name or chat.username or str(chat.id)
     )
-    conn.commit()
-    conn.close()
 
 
 def get_all_known_chat_ids() -> list[int]:
@@ -236,11 +282,14 @@ class _PGCursor:
     execute(...) возвращает сам объект (для цепочки .execute(...).fetchone()),
     plus fetchone()/fetchall()/lastrowid."""
 
-    def __init__(self, pg_cursor):
+    def __init__(self, pg_cursor, owner=None):
         self._cur = pg_cursor
+        self._owner = owner
         self.lastrowid = None  # у Postgres нет lastrowid — см. create_order (RETURNING)
 
     def execute(self, sql: str, params=()):
+        if self._owner is not None:
+            self._owner._ensure_tx_for(sql)
         self._cur.execute(_pg_translate_sql(sql), tuple(params))
         return self
 
@@ -262,30 +311,53 @@ class _PGConn:
     ВАЖНО: connection здесь не "своё", а взято из общего пула (_pg_pool).
     close() поэтому не закрывает TCP-соединение, а возвращает его в пул —
     открывать новое соединение (TCP+TLS-хэндшейк) на каждый чих было главной
-    причиной тормозов бота (пара секунд на апдейт вместо миллисекунд)."""
+    причиной тормозов бота (пара секунд на апдейт вместо миллисекунд).
+
+    ОПТИМИЗАЦИЯ (отклик): раньше любой SELECT открывал транзакцию, и при
+    возврате соединения в пул делался лишний сетевой ROLLBACK — то есть каждое
+    чтение стоило ДВУХ походов до удалённой БД. Теперь соединение стартует в
+    режиме autocommit (чтения идут без транзакции и без ROLLBACK), а на первой
+    же записывающей команде переключается в обычный режим транзакции, так что
+    атомарность записи (execute… + commit()) не меняется."""
+
+    _READ_PREFIXES = ("select", "show", "explain", "with")
 
     def __init__(self, pg_conn):
         self._conn = pg_conn
+        try:
+            self._conn.autocommit = True
+        except Exception:
+            pass
+
+    def _ensure_tx_for(self, sql: str):
+        if sql.lstrip()[:7].lower().startswith(self._READ_PREFIXES):
+            return
+        if self._conn.autocommit:
+            self._conn.autocommit = False  # переключение чисто клиентское, без сети
 
     def _cursor(self):
         return self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
     def execute(self, sql: str, params=()):
-        cur = _PGCursor(self._cursor())
+        self._ensure_tx_for(sql)
+        cur = _PGCursor(self._cursor(), self)
         return cur.execute(sql, params)
 
     def cursor(self):
-        return _PGCursor(self._cursor())
+        return _PGCursor(self._cursor(), self)
 
     def commit(self):
-        self._conn.commit()
+        if not self._conn.autocommit:
+            self._conn.commit()
 
     def close(self):
         try:
-            # если в соединении осталась незакоммиченная/сорвавшаяся
-            # транзакция — откатываем перед возвратом в пул, иначе следующий
-            # код, который его получит, unexpectedly словит чужую ошибку
-            self._conn.rollback()
+            if not self._conn.autocommit:
+                # если в соединении осталась незакоммиченная/сорвавшаяся
+                # транзакция — откатываем перед возвратом в пул, иначе следующий
+                # код, который его получит, unexpectedly словит чужую ошибку
+                self._conn.rollback()
+                self._conn.autocommit = True
         except Exception:
             pass
         try:
@@ -299,22 +371,66 @@ class _PGConn:
 
 _pg_pool = None
 if USE_POSTGRES:
-    # minconn=1, maxconn=20 — с запасом для параллельных апдейтов aiogram;
+    # minconn=2, maxconn=20 — с запасом для параллельных апдейтов aiogram;
     # соединения переиспользуются, а не создаются заново на каждый запрос.
-    _pg_pool = psycopg2.pool.ThreadedConnectionPool(1, 20, DATABASE_URL)
+    # keepalives — чтобы удалённая БД (Supabase/Neon) не рвала "спящие"
+    # соединения, после чего первый запрос тратил время на переподключение.
+    _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+        2, 20, DATABASE_URL,
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+    )
+
+
+_sqlite_local = threading.local()
+
+
+class _SqliteConn:
+    """Постоянное (на поток) соединение SQLite с теми же методами, что и раньше.
+    ОПТИМИЗАЦИЯ (отклик): раньше на КАЖДЫЙ вызов db() заново открывался файл и
+    выполнялись два PRAGMA. Теперь соединение живёт долго, а close() лишь
+    откатывает незакоммиченное (как и раньше при закрытии настоящего соединения)."""
+
+    def __init__(self, raw: sqlite3.Connection):
+        self._raw = raw
+
+    def execute(self, sql, params=()):
+        return self._raw.execute(sql, params)
+
+    def cursor(self):
+        return self._raw.cursor()
+
+    def commit(self):
+        self._raw.commit()
+
+    def rollback(self):
+        self._raw.rollback()
+
+    def close(self):
+        try:
+            if self._raw.in_transaction:
+                self._raw.rollback()
+        except Exception:
+            pass
 
 
 def db():
     if USE_POSTGRES:
         pg_conn = _pg_pool.getconn()
+        if pg_conn.closed:  # соединение успели оборвать на стороне сервера
+            _pg_pool.putconn(pg_conn, close=True)
+            pg_conn = _pg_pool.getconn()
         return _PGConn(pg_conn)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    # WAL — читатели не блокируют писателя и наоборот (меньше "database is locked"
-    # при параллельных запросах от разных игроков); NORMAL — быстрее fsync, безопасно с WAL.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    wrapper = getattr(_sqlite_local, "conn", None)
+    if wrapper is None:
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn.row_factory = sqlite3.Row
+        # WAL — читатели не блокируют писателя и наоборот (меньше "database is locked"
+        # при параллельных запросах от разных игроков); NORMAL — быстрее fsync, безопасно с WAL.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        wrapper = _SqliteConn(conn)
+        _sqlite_local.conn = wrapper
+    return wrapper
 
 
 def init_db():
@@ -522,6 +638,9 @@ def _migrate_columns(conn: sqlite3.Connection):
             "marriage_xp": "INTEGER DEFAULT 0",
             "marriage_level": "INTEGER DEFAULT 1",
             "pending_msg_id": "INTEGER",
+            # подтверждение имени питомца: кандидат на имя и чат, где его ждём
+            "pending_name": "TEXT",
+            "pending_chat_id": "BIGINT",
             # по запросу: ларцы — редкий предмет, открывается 3 ключами (см. LARETS_PRIZES)
             "larets": "INTEGER DEFAULT 0",
         },
@@ -569,6 +688,7 @@ _BIGINT_COLUMNS = [
     ("users", "user_id"),
     ("users", "spouse_id"),
     ("users", "pending_marriage_from"),
+    ("users", "pending_chat_id"),
     ("pets", "user_id"),
     ("pets", "fight_opponent_id"),
     ("quests", "user_id"),
@@ -665,9 +785,29 @@ def update_pet(user_id: int, **fields):
     upsert_pet(user_id, **fields)
 
 
+# Кто сейчас «чего-то ждёт» (имя питомца / заявка админам). Хранится и в БД,
+# но здесь — копия в памяти: хендлер обычного текста раньше лез в БД на КАЖДОЕ
+# сообщение в каждом чате, чтобы узнать, ждём ли мы от автора имя питомца.
+# Теперь для 99% сообщений это проверка в памяти без обращения к базе.
+PENDING_USERS: set[int] = set()
+
+
+def load_pending_users():
+    conn = db()
+    rows = conn.execute("SELECT user_id FROM users WHERE pending_action IS NOT NULL").fetchall()
+    conn.close()
+    PENDING_USERS.clear()
+    PENDING_USERS.update(int(r["user_id"]) for r in rows)
+
+
 def update_user(user_id: int, **fields):
     if not fields:
         return
+    if "pending_action" in fields:
+        if fields["pending_action"]:
+            PENDING_USERS.add(user_id)
+        else:
+            PENDING_USERS.discard(user_id)
     conn = db()
     cur = conn.cursor()
     sets = ", ".join(f"{k}=?" for k in fields)
@@ -807,6 +947,54 @@ ANIMAL_TRACK_LABELS = {
     "олень": "🦌 Олень",
     "кабан": "🐗 Кабан",
 }
+
+# --- ПОДСКАЗКИ к мини-игре «Чей след?» ---
+# У каждого зверя: схема следа (моно-рисунок), «решающие» улики (только он) и
+# «общие» (подходят ещё кому-то). Игроку показываются схема + 1 общая + 1 решающая
+# улика правильного зверя, так что угадать можно по уликам, а не наугад.
+# Справка по всем следам — команда «следы».
+TRACK_INFO = {
+    "заяц": {
+        "art": " ▪   ▪\n▪▪   ▪▪\n ▪   ▪",
+        "name": "заяц",
+        "unique": [
+            "Следы собраны «четвёркой»: два длинных отпечатка впереди, два маленьких позади.",
+            "Прыжки длинные, а отпечатки вытянутые, без раздвоенных копытец.",
+            "Рядом ни капли глубины в земле — зверь лёгкий, почти не продавливает снег и грязь.",
+        ],
+        "shared": [
+            "След совсем небольшой — меньше ладони.",
+            "Следы идут петлями и резкими поворотами.",
+        ],
+    },
+    "олень": {
+        "art": "◖◗  \n  ◖◗\n◖◗  \n  ◖◗",
+        "name": "олень",
+        "unique": [
+            "Копытца узкие и вытянутые, острыми концами вперёд, шаг ровный и длинный.",
+            "Следы идут шахматной цепочкой, почти по одной линии, без боковых отпечатков.",
+            "Рядом объеденные верхушки веток и молодые побеги на высоте человеческого роста.",
+        ],
+        "shared": [
+            "Отпечаток раздвоенный — два «лепестка» копыта.",
+            "Размер следа примерно с ладонь.",
+        ],
+    },
+    "кабан": {
+        "art": "●● ●●\n●●  ●●\n●● ●●",
+        "name": "кабан",
+        "unique": [
+            "Позади копыт видны два маленьких круглых отпечатка — боковые пальцы.",
+            "Копыта широкие и тупые, след глубокий, земля вокруг взрыта.",
+            "Рядом клочья шерсти на коре и «купальня» — вытоптанная лужа.",
+        ],
+        "shared": [
+            "Отпечаток раздвоенный — два «лепестка» копыта.",
+            "Размер следа примерно с ладонь.",
+        ],
+    },
+}
+
 GAME_WIN_LOOT_BONUS_PERCENT = 25   # +25% к добыче и опыту при угадывании следа
 GAME_WIN_WEIGHT_LOSS_MULT = 0.6    # угадал — меньше устал, вес теряется на 40% меньше
 GAME_TIMEOUT_SECONDS = 10 * 60     # если не ответил за 10 минут — авто-результат без бонуса
@@ -1536,7 +1724,7 @@ def potions_kb(user_id: int, pet: sqlite3.Row) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def safe_edit_or_send(target: Message, text: str, kb: InlineKeyboardMarkup | None = None,
-                             owner_id: int | None = None):
+                             owner_id: int | None = None, parse_mode: str | None = None):
     """Пытается изменить существующее сообщение (без флуда, ).
     Если не получилось (нет прав / сообщение не бота / устарело) — отправляет новое.
 
@@ -1549,9 +1737,9 @@ async def safe_edit_or_send(target: Message, text: str, kb: InlineKeyboardMarkup
     """
     try:
         if target.photo:
-            await target.edit_caption(caption=text, reply_markup=kb)
+            await target.edit_caption(caption=text, reply_markup=kb, parse_mode=parse_mode)
         else:
-            await target.edit_text(text, reply_markup=kb)
+            await target.edit_text(text, reply_markup=kb, parse_mode=parse_mode)
         if owner_id is not None:
             remember_owner(target.chat.id, target.message_id, owner_id)
         return
@@ -1564,11 +1752,24 @@ async def safe_edit_or_send(target: Message, text: str, kb: InlineKeyboardMarkup
     except Exception:
         pass
     try:
-        sent = await target.answer(text, reply_markup=kb)
+        sent = await target.answer(text, reply_markup=kb, parse_mode=parse_mode)
         if owner_id is not None:
             remember_owner(sent.chat.id, sent.message_id, owner_id)
     except Exception as e:
         log.warning("Не удалось отправить сообщение: %s", e)
+
+
+def set_pending(user_id: int, action: str, sent: Message):
+    """Ставит «ожидание ответа» (имя питомца): запоминает действие, ЧАТ и
+    id сообщения-запроса. Имя принимается только реплаем именно на это
+    сообщение бота (см. handle_pending_text)."""
+    update_user(user_id, pending_action=action, pending_msg_id=sent.message_id,
+                pending_chat_id=sent.chat.id, pending_name=None)
+
+
+def clear_pending(user_id: int):
+    update_user(user_id, pending_action=None, pending_msg_id=None,
+                pending_chat_id=None, pending_name=None)
 
 
 async def send_pet_screen(chat_id: int, user_id: int, edit_message: Message | None = None):
@@ -1588,7 +1789,7 @@ async def send_pet_screen(chat_id: int, user_id: int, edit_message: Message | No
             sent = await bot.send_message(chat_id, text)
             remember_owner(sent.chat.id, sent.message_id, user_id)
         # запоминаем id этого сообщения, чтобы принять имя только ответом на него
-        update_user(user_id, pending_action="tame", pending_msg_id=sent.message_id)
+        set_pending(user_id, "tame", sent)
         return
 
     if not pet["alive"]:
@@ -1699,6 +1900,9 @@ async def cmd_help(message: Message):
         "🔁 ПЕРЕДАЧА РЕСУРСОВ\n"
         "!передать <кол-во> <ресурс> @username — передать ресурс другому игроку\n"
         "(мясо, дерево, готовое мясо, зелья, руны, ключи, кольца)\n\n"
+        "📨 ЗАЯВКА АДМИНАМ (в личке)\n"
+        "«заявка» — список предметов + скриншоты, админ выдаёт одной кнопкой\n\n"
+        "🐾 «следы» — как читать следы в лесу (мини-игра «Чей след?»)\n\n"
         "🏪 МАГАЗИН\n"
         "«магазин» — префиксы, скины, зелья, кольца, анти-таргет\n\n"
         "🛠 АДМИНИСТРАЦИЯ (для админов)\n"
@@ -2415,90 +2619,124 @@ def set_marriage_action_cooldown(user_id: int, action_id: str, available_at: dat
     conn.close()
 
 
+def get_all_marriage_cooldowns(user_id: int) -> dict[str, datetime]:
+    """Все кулдауны действий брака ОДНИМ запросом (раньше меню делало по
+    отдельному запросу к БД на каждое из ~35 действий — это и тормозило)."""
+    conn = db()
+    rows = conn.execute(
+        "SELECT action_id, available_at FROM marriage_action_cooldowns WHERE user_id=?",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return {r["action_id"]: datetime.fromisoformat(r["available_at"]) for r in rows}
+
+
 def marriage_info_text(user_id: int) -> str:
-    # «брак» — информационная карточка о браке: партнёр, уровень пары, опыт.
-    # Полный список доступных действий — кнопка ниже или команда «брак действия».
+    # «брак» — компактная карточка в моно-режиме: партнёр, уровень пары, опыт.
     user = get_or_create_user(user_id, "", "")
     level = marriage_level_from_xp(user["marriage_xp"])
     xp_in_level = user["marriage_xp"] - (level - 1) * MARRIAGE_XP_PER_LEVEL
     spouse_line = "нет"
     if user["spouse_id"]:
         spouse = get_or_create_user(user["spouse_id"], "", "")
-        spouse_line = spouse["display_name"]
-
-    lines = [
-        "💍 БРАК",
-        f"👤 Партнёр: {spouse_line}",
-        f"⭐ Уровень пары: {level}",
-        f"✨ Опыт: {user['marriage_xp']} XP ({xp_in_level}/{MARRIAGE_XP_PER_LEVEL} до след. уровня)",
-        "",
-        "🌲🏹 «Лес»/«Охота» в меню волка — можно пойти вместе с партнёром.",
-    ]
-    return "\n".join(lines)
+        spouse_line = spouse["display_name"] or "—"
+    filled = min(10, int(10 * xp_in_level / MARRIAGE_XP_PER_LEVEL))
+    bar = "█" * filled + "░" * (10 - filled)
+    card = (
+        f"Партнёр : {spouse_line}\n"
+        f"Уровень : {level}\n"
+        f"Опыт    : {user['marriage_xp']} XP\n"
+        f"До след.: {xp_in_level}/{MARRIAGE_XP_PER_LEVEL}\n"
+        f"[{bar}]"
+    )
+    return (
+        "💍 <b>БРАК</b>\n"
+        f"<pre>{html.escape(card)}</pre>\n"
+        "Команды (нажмите — скопируется):\n"
+        "<code>брак действия</code> — список действий\n"
+        "<code>покормить партнёра</code>\n"
+        "<code>развод</code>\n"
+        "🌲🏹 «Лес»/«Охота» в меню волка — можно пойти вместе."
+    )
 
 
 def marriage_info_kb(user_id: int) -> InlineKeyboardMarkup:
-    rows = [[copy_text_button("🍖 Покормить партнёра", "покормить партнёра")]]
-    rows.append([InlineKeyboardButton(text="💞 Действия в браке", callback_data="marriage_actions")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    # одна кнопка вместо россыпи
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💞 Действия в браке", callback_data="marriage_actions")],
+    ])
 
 
 def marriage_actions_text(user_id: int) -> str:
-    # показываем только те действия, которые реально разрешены прямо
-    # сейчас (уровень открыт и нет кулдауна). Всё остальное просто скрыто.
+    # Только доступные сейчас действия, одним моно-списком. Каждая команда
+    # обёрнута в <code> — в Telegram по нажатию она копируется целиком,
+    # поэтому отдельные кнопки на каждое действие больше не нужны.
     user = get_or_create_user(user_id, "", "")
     level = marriage_level_from_xp(user["marriage_xp"])
     now = datetime.utcnow()
     growth_mult = 1 + (level - 1) * MARRIAGE_ACTION_LEVEL_GROWTH_PERCENT / 100
+    cooldowns = get_all_marriage_cooldowns(user_id)
 
     available = []
+    waiting = 0
+    next_wait: timedelta | None = None
+    next_unlock: tuple[int, str] | None = None
     for action_id, title, xp, cooldown, unlock_level in MARRIAGE_ACTIONS:
         if level < unlock_level:
+            if next_unlock is None or unlock_level < next_unlock[0]:
+                next_unlock = (unlock_level, title)
             continue
-        avail_at = get_marriage_action_cooldown(user_id, action_id)
+        avail_at = cooldowns.get(action_id)
         if avail_at and now < avail_at:
+            waiting += 1
+            left = avail_at - now
+            if next_wait is None or left < next_wait:
+                next_wait = left
             continue
-        xp_shown = round(xp * growth_mult)
-        available.append(f"✅ «{title}» +{xp_shown}")
+        available.append(f"<code>{html.escape(title)}</code> +{round(xp * growth_mult)}")
 
     lines = [
-        "💍 ДЕЙСТВИЯ В БРАКЕ",
-        "Нажмите на кнопку, чтобы скопировать команду, и отправьте её сообщением "
-        "(отвечать на сообщение партнёра не обязательно):",
+        "💍 <b>ДЕЙСТВИЯ В БРАКЕ</b>",
+        "Нажмите на команду — она скопируется, отправьте её в чат:",
         "",
+        "<code>покормить партнёра</code>",
     ]
-    if available:
-        lines.extend(available)
-    else:
-        lines.append("Пока нет доступных действий — загляните чуть позже.")
+    lines.extend(available if available else ["Сейчас доступных действий нет."])
+    footer = []
+    if waiting:
+        footer.append(f"⏳ На перезарядке: {waiting} (ближайшее через {fmt_timedelta(next_wait)})")
+    if next_unlock:
+        footer.append(f"🔒 С {next_unlock[0]} ур. брака: «{next_unlock[1]}»")
     if level > 1:
+        footer.append(f"💞 Бонус пары: +{MARRIAGE_ACTION_LEVEL_GROWTH_PERCENT * (level - 1)}% к опыту")
+    if footer:
         lines.append("")
-        lines.append(f"💞 Бонус за уровень пары: +{MARRIAGE_ACTION_LEVEL_GROWTH_PERCENT * (level - 1)}% к опыту за все действия.")
+        lines.extend(footer)
     return "\n".join(lines)
 
 
 def marriage_actions_kb(user_id: int) -> InlineKeyboardMarkup:
-    # кнопки копируют текст команды по нажатию; показаны только
-    # действия, доступные прямо сейчас (открыт уровень и нет кулдауна)
-    user = get_or_create_user(user_id, "", "")
-    level = marriage_level_from_xp(user["marriage_xp"])
-    now = datetime.utcnow()
-
-    rows = [[copy_text_button("🍖 Покормить партнёра", "покормить партнёра")]]
-    for action_id, title, xp, cooldown, unlock_level in MARRIAGE_ACTIONS:
-        if level < unlock_level:
-            continue
-        avail_at = get_marriage_action_cooldown(user_id, action_id)
-        if avail_at and now < avail_at:
-            continue
-        rows.append([copy_text_button(title, title)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅ К браку", callback_data="marriage_info")],
+    ])
 
 
 @dp.callback_query(F.data.startswith("marriage_hint_"))
 async def cb_marriage_hint(callback: CallbackQuery):
-    # запасной вариант на случай, если aiogram/клиент не поддерживает copy_text
+    # оставлено для старых сообщений с прежними кнопками
     await callback.answer("Отправьте этот текст сообщением в чат 👆", show_alert=True)
+
+
+@dp.callback_query(F.data == "marriage_info")
+async def cb_marriage_info(callback: CallbackQuery):
+    u = callback.from_user
+    user = get_or_create_user(u.id, u.username or "", u.full_name)
+    if not user["spouse_id"]:
+        await callback.answer("Вы не состоите в браке.", show_alert=True)
+        return
+    await safe_edit_or_send(callback.message, marriage_info_text(u.id), marriage_info_kb(u.id),
+                            owner_id=u.id, parse_mode="HTML")
+    await callback.answer()
 
 
 @dp.message(F.text.func(lambda t: _normalize_ru(t) == "покормить партнера"))
@@ -2580,7 +2818,7 @@ async def cmd_marriage_menu_or_propose(message: Message):
     u = message.from_user
     user = get_or_create_user(u.id, u.username or "", u.full_name)
     if user["spouse_id"]:
-        sent = await reply_or_send(message, marriage_info_text(u.id), reply_markup=marriage_info_kb(u.id))
+        sent = await reply_or_send(message, marriage_info_text(u.id), reply_markup=marriage_info_kb(u.id), parse_mode="HTML")
         remember_owner(sent.chat.id, sent.message_id, u.id)
         return
     await cmd_marry(message)
@@ -2595,7 +2833,7 @@ async def cmd_marriage_actions(message: Message):
     if not user["spouse_id"]:
         await reply_or_send(message, "Вы не состоите в браке.")
         return
-    sent = await reply_or_send(message, marriage_actions_text(u.id), reply_markup=marriage_actions_kb(u.id))
+    sent = await reply_or_send(message, marriage_actions_text(u.id), reply_markup=marriage_actions_kb(u.id), parse_mode="HTML")
     remember_owner(sent.chat.id, sent.message_id, u.id)
 
 
@@ -2606,7 +2844,7 @@ async def cb_marriage_actions(callback: CallbackQuery):
     if not user["spouse_id"]:
         await callback.answer("Вы не состоите в браке.", show_alert=True)
         return
-    await safe_edit_or_send(callback.message, marriage_actions_text(u.id), marriage_actions_kb(u.id), owner_id=u.id)
+    await safe_edit_or_send(callback.message, marriage_actions_text(u.id), marriage_actions_kb(u.id), owner_id=u.id, parse_mode="HTML")
     await callback.answer()
 
 
@@ -2970,11 +3208,14 @@ async def cb_decline_revive(callback: CallbackQuery):
     pet = get_pet(u.id)
     name = pet["name"] if pet else "питомца"
     update_pet(u.id, name=None)
-    update_user(u.id, pending_action="tame")
-    await reply_or_send(callback.message, 
+    sent = await reply_or_send(callback.message, 
         f"Вы решили не воскрешать «{name}». Он отправляется в лучший мир... 💔\n\n"
-        "🐾 Придумайте имя вашему новому питомцу:"
+        "🐾 Придумайте имя вашему новому питомцу и ОТВЕТЬТЕ РЕПЛАЕМ на это сообщение с именем:"
     )
+    remember_owner(sent.chat.id, sent.message_id, u.id)
+    # БАГФИКС: раньше здесь не сохранялся id сообщения-запроса, и из-за этого
+    # имя принималось от ЛЮБОГО реплая (даже на чужое сообщение)
+    set_pending(u.id, "tame", sent)
     await callback.answer()
 
 
@@ -3710,7 +3951,8 @@ async def cb_rename(callback: CallbackQuery):
     sent = await reply_or_send(callback.message, 
         "✏️ Пришлите новое имя для питомца ОТВЕТОМ (реплаем) на это сообщение."
     )
-    update_user(u.id, pending_action="rename", pending_msg_id=sent.message_id)
+    remember_owner(sent.chat.id, sent.message_id, u.id)
+    set_pending(u.id, "rename", sent)
     await callback.answer()
 
 
@@ -4089,7 +4331,7 @@ async def cb_buy_antitarget(callback: CallbackQuery):
 #  ЗАЯВКИ АДМИНАМ НА РУЧНУЮ ВЫДАЧУ
 # =========================================================
 
-async def create_order(user: sqlite3.Row, product: str, payload: dict) -> int:
+def _insert_order(user, product: str, payload: dict) -> int:
     conn = db()
     cur = conn.cursor()
     insert_sql = (
@@ -4097,7 +4339,7 @@ async def create_order(user: sqlite3.Row, product: str, payload: dict) -> int:
         "VALUES (?,?,?,?,?,?,?)"
     )
     params = (user["user_id"], user["username"] or "", user["display_name"] or "", product, "pending",
-              datetime.utcnow().isoformat(), json.dumps(payload))
+              datetime.utcnow().isoformat(), json.dumps(payload, ensure_ascii=False))
     if USE_POSTGRES:
         # у Postgres нет lastrowid — забираем сгенерированный id через RETURNING
         cur.execute(insert_sql + " RETURNING order_id", params)
@@ -4107,8 +4349,22 @@ async def create_order(user: sqlite3.Row, product: str, payload: dict) -> int:
         order_id = cur.lastrowid
     conn.commit()
     conn.close()
+    return order_id
+
+
+async def create_order(user: sqlite3.Row, product: str, payload: dict) -> int:
+    order_id = _insert_order(user, product, payload)
     await notify_admins_new_order(order_id, user, product)
     return order_id
+
+
+def _contact_lines(user) -> str:
+    username = user["username"] or ""
+    return (
+        "Связаться с пользователем:\n"
+        f"Android: {'https://t.me/' + username if username else 'tg://openmessage?user_id=' + str(user['user_id'])}\n"
+        f"iOS: tg://user?id={user['user_id']}"
+    )
 
 
 async def notify_admins_new_order(order_id: int, user: sqlite3.Row, product: str):
@@ -4119,9 +4375,7 @@ async def notify_admins_new_order(order_id: int, user: sqlite3.Row, product: str
         f"Товар: {product}\n"
         f"Пользователь: {display}" + (f" (@{username})" if username else "") + "\n"
         f"ID: {user['user_id']}\n\n"
-        "Связаться с пользователем:\n"
-        f"Android: {'https://t.me/' + username if username else 'tg://openmessage?user_id=' + str(user['user_id'])}\n"
-        f"iOS: tg://user?id={user['user_id']}\n\n"
+        f"{_contact_lines(user)}\n\n"
         "Используйте /list, чтобы взять заказ в работу."
     )
     for admin_id in get_all_admin_ids():
@@ -4140,67 +4394,155 @@ def get_pending_orders(limit: int = 50) -> list[sqlite3.Row]:
     return rows
 
 
-async def fulfill_order(order_id: int, admin_id: int) -> tuple[bool, str]:
+def _claim_order(order_id: int, new_status: str, admin_id: int):
+    """Атомарно «занимает» заказ (pending -> new_status). Возвращает строку заказа,
+    если именно этот вызов занял его, иначе None. Защита от двойного нажатия
+    «Выдать» (раньше два быстрых клика могли выдать товар дважды)."""
     conn = db()
-    o = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
+    cur = conn.execute(
+        "UPDATE orders SET status=?, taken_by=? WHERE order_id=? AND status='pending'",
+        (new_status, admin_id, order_id),
+    )
+    claimed = cur.rowcount == 1
+    conn.commit()
+    o = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone() if claimed else None
     conn.close()
-    if o is None or o["status"] != "pending":
+    return o
+
+
+def _extend_until(user_id: int, column: str, days: int) -> datetime:
+    user = get_or_create_user(user_id, "", "")
+    base = datetime.utcnow()
+    current = datetime.fromisoformat(user[column]) if user[column] else base
+    if current < base:
+        current = base
+    new_until = current + timedelta(days=days)
+    update_user(user_id, **{column: new_until.isoformat()})
+    return new_until
+
+
+def grant_resource_core(target_id: int, resource: str, amount: int) -> str | None:
+    """Начисляет ресурс без сообщений в чат. Возвращает текст ошибки или None."""
+    kind = RESOURCE_TARGET[resource]
+    if kind == "user":
+        conn = db()
+        conn.execute(f"UPDATE users SET {resource} = {resource} + ? WHERE user_id=?", (amount, target_id))
+        conn.commit()
+        conn.close()
+        if resource == "xp":
+            pet = get_pet(target_id)
+            if pet is not None and pet["alive"]:
+                grant_pet_xp(pet, amount)
+    elif kind == "pet":
+        pet = get_pet(target_id)
+        if pet is None or not pet["alive"]:
+            return "у игрока нет живого питомца"
+        new_value = pet[resource] + amount
+        if resource == "weight":
+            new_value = min(MAX_PET_WEIGHT, new_value)
+        update_pet(target_id, **{resource: new_value})
+    else:  # marriage
+        me = get_or_create_user(target_id, "", "")
+        update_user(target_id, marriage_xp=me["marriage_xp"] + amount)
+        if me["spouse_id"]:
+            sp = get_or_create_user(me["spouse_id"], "", "")
+            update_user(me["spouse_id"], marriage_xp=sp["marriage_xp"] + amount)
+    return None
+
+
+def describe_item(item: dict) -> str:
+    t = item["t"]
+    if t == "prefix":
+        return f"📛 Префикс на {item['days']} дн."
+    if t == "antitarget":
+        return f"🛡 Анти-таргет на {item['days']} дн."
+    if t == "skin":
+        return f"🎭 Скин «{item['name']}»"
+    return f"{RESOURCE_ICONS.get(item['res'], '📦')} {item['amount']} {RESOURCE_NAMES_RU.get(item['res'], item['res'])}"
+
+
+def apply_item(user_id: int, item: dict) -> tuple[bool, str]:
+    """Выдаёт один предмет заявки. Возвращает (успех, строка для отчёта)."""
+    t = item["t"]
+    try:
+        if t == "prefix":
+            until = _extend_until(user_id, "prefix_until", item["days"])
+            return True, f"{describe_item(item)} — до {until.strftime('%d.%m.%Y %H:%M')}"
+        if t == "antitarget":
+            until = _extend_until(user_id, "antitarget_until", item["days"])
+            return True, f"{describe_item(item)} — до {until.strftime('%d.%m.%Y %H:%M')}"
+        if t == "skin":
+            if not skin_exists(item["name"]):
+                return False, f"{describe_item(item)} — скин не найден"
+            grant_skin_ownership(user_id, item["name"])
+            pet = get_pet(user_id)
+            if pet is not None and pet["alive"]:
+                update_pet(user_id, skin=item["name"])
+            return True, describe_item(item)
+        err = grant_resource_core(user_id, item["res"], item["amount"])
+        if err:
+            return False, f"{describe_item(item)} — {err}"
+        return True, describe_item(item)
+    except Exception as e:
+        log.error("Не удалось выдать предмет %s: %s", item, e, exc_info=True)
+        return False, f"{describe_item(item)} — ошибка выдачи"
+
+
+async def fulfill_order(order_id: int, admin_id: int) -> tuple[bool, str]:
+    o = _claim_order(order_id, "processing", admin_id)
+    if o is None:
         return False, "Этот заказ уже обработан."
 
     payload = json.loads(o["payload"]) if o["payload"] else {}
     user_id = o["user_id"]
-    user = get_or_create_user(user_id, "", "")
     ptype = payload.get("type")
-    base = datetime.utcnow()
+    admin_report = None
 
     if ptype == "prefix":
-        days = payload["days"]
-        current = datetime.fromisoformat(user["prefix_until"]) if user["prefix_until"] else base
-        if current < base:
-            current = base
-        new_until = current + timedelta(days=days)
-        update_user(user_id, prefix_until=new_until.isoformat())
-        result_text = f"✅ Ваш заказ «{o['product']}» выполнен! Префикс активен до {new_until.strftime('%d.%m.%Y %H:%M')}"
+        until = _extend_until(user_id, "prefix_until", payload["days"])
+        result_text = f"✅ Ваш заказ «{o['product']}» выполнен! Префикс активен до {until.strftime('%d.%m.%Y %H:%M')}"
     elif ptype == "antitarget":
-        days = payload["days"]
-        current = datetime.fromisoformat(user["antitarget_until"]) if user["antitarget_until"] else base
-        if current < base:
-            current = base
-        new_until = current + timedelta(days=days)
-        update_user(user_id, antitarget_until=new_until.isoformat())
-        result_text = f"✅ Ваш заказ «{o['product']}» выполнен! Анти-таргет активен до {new_until.strftime('%d.%m.%Y %H:%M')}"
+        until = _extend_until(user_id, "antitarget_until", payload["days"])
+        result_text = f"✅ Ваш заказ «{o['product']}» выполнен! Анти-таргет активен до {until.strftime('%d.%m.%Y %H:%M')}"
+    elif ptype == "bundle":
+        results = [apply_item(user_id, it) for it in payload.get("items", [])]
+        ok_count = sum(1 for ok, _ in results if ok)
+        lines = [("✅ " if ok else "❌ ") + line for ok, line in results]
+        result_text = f"🎁 Ваша заявка #{order_id} обработана ({ok_count}/{len(results)}):\n" + "\n".join(lines)
+        admin_report = f"Заявка #{order_id}: выдано {ok_count}/{len(results)}\n" + "\n".join(lines)
     else:
         result_text = f"✅ Ваш заказ «{o['product']}» выполнен!"
 
     conn = db()
-    conn.execute("UPDATE orders SET status='done', taken_by=? WHERE order_id=?", (admin_id, order_id))
+    conn.execute("UPDATE orders SET status='done' WHERE order_id=?", (order_id,))
     conn.commit()
     conn.close()
     try:
         await bot.send_message(user_id, result_text)
     except Exception:
         pass
-    return True, result_text
+    return True, admin_report or result_text
 
 
 async def decline_order(order_id: int, admin_id: int) -> tuple[bool, str]:
-    conn = db()
-    o = conn.execute("SELECT * FROM orders WHERE order_id=?", (order_id,)).fetchone()
-    if o is None or o["status"] != "pending":
-        conn.close()
+    o = _claim_order(order_id, "declined", admin_id)
+    if o is None:
         return False, "Этот заказ уже обработан."
     payload = json.loads(o["payload"]) if o["payload"] else {}
     price = payload.get("price", 0)
     if price:
+        conn = db()
         conn.execute("UPDATE users SET dollars = dollars + ? WHERE user_id=?", (price, o["user_id"]))
-    conn.execute("UPDATE orders SET status='declined', taken_by=? WHERE order_id=?", (admin_id, order_id))
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
     try:
-        await bot.send_message(o["user_id"], f"❌ Ваш заказ «{o['product']}» отклонён администратором. Деньги возвращены.")
+        await bot.send_message(
+            o["user_id"],
+            f"❌ Ваш заказ «{o['product']}» отклонён администратором." + (" Деньги возвращены." if price else ""),
+        )
     except Exception:
         pass
-    return True, "Заказ отклонён, деньги возвращены."
+    return True, "Заказ отклонён" + (", деньги возвращены." if price else ".")
 
 
 def order_summary_kb(count: int) -> InlineKeyboardMarkup:
@@ -4209,11 +4551,54 @@ def order_summary_kb(count: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def order_item_kb(order_id: int) -> InlineKeyboardMarkup:
+def order_item_kb(order_id: int, bundle: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Взять в работу", callback_data=f"order_take_{order_id}"),
+        InlineKeyboardButton(text="✅ Выдать всё" if bundle else "✅ Взять в работу",
+                             callback_data=f"order_take_{order_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"order_decline_{order_id}"),
     ]])
+
+
+async def send_shots(chat_id: int, shots: list[dict]):
+    """Отправляет скрины заявки: фото — альбомом (до 10), файлы-картинки — отдельно."""
+    photos = [x["id"] for x in shots if x.get("k") == "photo"][:10]
+    docs = [x["id"] for x in shots if x.get("k") == "doc"]
+    try:
+        if len(photos) == 1:
+            await bot.send_photo(chat_id, photos[0])
+        elif photos:
+            await bot.send_media_group(chat_id, [InputMediaPhoto(media=fid) for fid in photos])
+        for fid in docs:
+            await bot.send_document(chat_id, fid)
+    except Exception as e:
+        log.warning("Не удалось отправить скрины заявки в %s: %s", chat_id, e)
+
+
+def bundle_admin_text(order_id: int, user, payload: dict) -> str:
+    username = user["username"] or ""
+    display = (user["display_name"] or str(user["user_id"])).upper()
+    items = "\n".join(f"{i}. {describe_item(it)}" for i, it in enumerate(payload.get("items", []), 1))
+    note = payload.get("note")
+    return (
+        f"📨 Заявка #{order_id} на выдачу\n"
+        "————————————\n"
+        f"От: {display}" + (f" (@{username})" if username else "") + f"\nID: {user['user_id']}\n\n"
+        f"Список ({len(payload.get('items', []))}):\n{items}\n"
+        f"📸 Скринов: {len(payload.get('shots', []))} (выше)\n"
+        + (f"💬 Комментарий: {note}\n" if note else "")
+        + f"\n{_contact_lines(user)}\n\n"
+        "Одна кнопка выдаст всё сразу."
+    )
+
+
+async def notify_admins_bundle(order_id: int, user, payload: dict):
+    text = bundle_admin_text(order_id, user, payload)
+    for admin_id in get_all_admin_ids():
+        try:
+            await send_shots(admin_id, payload.get("shots", []))
+            await bot.send_message(admin_id, text, reply_markup=order_item_kb(order_id, bundle=True))
+        except Exception as e:
+            log.warning("Не удалось уведомить админа %s о заявке: %s", admin_id, e)
 
 
 @dp.message(Command("list"))
@@ -4228,6 +4613,13 @@ async def cmd_list_orders(message: Message):
         return
     await reply_or_send(message, "📋 Список активных заказов:", reply_markup=order_summary_kb(len(orders)))
     for o in orders:
+        payload = json.loads(o["payload"]) if o["payload"] else {}
+        if payload.get("type") == "bundle":
+            owner = get_or_create_user(o["user_id"], "", "")
+            await send_shots(message.chat.id, payload.get("shots", []))
+            await bot.send_message(message.chat.id, bundle_admin_text(o["order_id"], owner, payload),
+                                   reply_markup=order_item_kb(o["order_id"], bundle=True))
+            continue
         await reply_or_send(message, 
             f"• Заказ #{o['order_id']} | {o['product']} | от {o['display_name']}",
             reply_markup=order_item_kb(o["order_id"]),
@@ -4255,7 +4647,9 @@ async def cb_order_take(callback: CallbackQuery):
     if not ok:
         await callback.answer(text, show_alert=True)
         return
-    await callback.message.edit_text(f"✅ Заказ #{order_id} успешно выполнен и закрыт.")
+    await callback.message.edit_text(
+        f"✅ Заказ #{order_id} успешно выполнен и закрыт." if not text.startswith("Заявка #") else f"✅ {text}"
+    )
     await callback.answer()
 
 
@@ -4334,6 +4728,296 @@ async def cb_buy_ring(callback: CallbackQuery):
 
 
 # =========================================================
+#  ЗАЯВКА В ЛС: список предметов + СКРИНЫ -> админу, выдача одной кнопкой
+# =========================================================
+# Игрок пишет боту в личку «заявка», присылает список предметов (по одному в
+# строке) и прикладывает скрины (обязательно). Админ получает в личку скрины,
+# аккуратный список и кнопку «✅ Выдать всё» — бот сам выдаёт каждый предмет.
+REQUEST_MAX_ITEMS = 15
+REQUEST_MAX_SHOTS = 10
+REQUEST_MAX_OPEN_PER_USER = 3
+REQUEST_MAX_AMOUNT = 1_000_000
+
+REQUEST_DRAFTS: dict[int, dict] = {}
+_REQUEST_TASKS: dict[int, asyncio.Task] = {}
+
+
+def _skin_lookup(name: str) -> str | None:
+    wanted = name.strip().lower().replace("ё", "е")
+    for known in list(SKINS) + get_all_custom_skin_names():
+        if known.lower().replace("ё", "е") == wanted:
+            return known
+    return None
+
+
+def parse_request_line(line: str) -> tuple[dict | None, str | None]:
+    """Разбирает одну строку заявки. Возвращает (предмет, None) или (None, ошибка)."""
+    raw = re.sub(r"^[\s\-–—•*·]+", "", line).strip()
+    norm = _normalize_ru(raw)
+    norm = re.sub(r"анти[\s\-]?таргет", "антитаргет", norm)
+    if not norm:
+        return None, None
+
+    m = re.match(r"^(префикс|антитаргет)\s*(?:на\s*)?(\d{1,2})(?:\s*(?:дн\w*|д|день|дня|дней))?$", norm)
+    if m:
+        days = int(m.group(2))
+        if not 1 <= days <= 30:
+            return None, f"«{raw}» — срок от 1 до 30 дней"
+        return {"t": "prefix" if m.group(1) == "префикс" else "antitarget", "days": days}, None
+
+    m = re.match(r"^скин\s+(.+)$", norm)
+    if m:
+        name = _skin_lookup(m.group(1))
+        if name is None:
+            return None, f"«{raw}» — такого скина нет"
+        return {"t": "skin", "name": name}, None
+
+    m = re.match(r"^(\d+)\s+(.+)$", norm)
+    if m:
+        amount = int(m.group(1))
+        resource = RESOURCE_RU_NORM.get(m.group(2).strip())
+        if resource is None or resource == "skin":
+            return None, f"«{raw}» — не знаю такой предмет"
+        if not 1 <= amount <= REQUEST_MAX_AMOUNT:
+            return None, f"«{raw}» — количество от 1 до {REQUEST_MAX_AMOUNT}"
+        return {"t": "res", "res": resource, "amount": amount}, None
+
+    return None, f"«{raw}» — не понял строку"
+
+
+def request_help_text() -> str:
+    return (
+        "📨 <b>ЗАЯВКА НА ВЫДАЧУ</b>\n"
+        "1) Пришлите список предметов — каждый с новой строки:\n"
+        "<pre>префикс 7 дней\n"
+        "антитаргет 3 дня\n"
+        "скин Один\n"
+        "100 долларов\n"
+        "5 ключей</pre>"
+        "2) Приложите <b>скриншоты</b> (обязательно, до 10 штук) — фото или файлом.\n"
+        "3) Нажмите «📤 Отправить админам».\n\n"
+        "Можно присылать частями: бот соберёт всё в один список. «отмена» — выйти."
+    )
+
+
+def _draft(user_id: int) -> dict:
+    d = REQUEST_DRAFTS.get(user_id)
+    if d is None:
+        d = {"items": [], "shots": [], "note": [], "summary": None}
+        REQUEST_DRAFTS[user_id] = d
+    return d
+
+
+def request_summary_text(d: dict, errors: list[str] | None = None) -> str:
+    lines = ["📨 <b>Ваша заявка</b>", ""]
+    if d["items"]:
+        lines.extend(f"{i}. {html.escape(describe_item(it))}" for i, it in enumerate(d["items"], 1))
+    else:
+        lines.append("Список пока пуст — пришлите предметы текстом.")
+    lines.append("")
+    lines.append(f"📸 Скринов: {len(d['shots'])}" + ("" if d["shots"] else " — <b>нужен хотя бы один!</b>"))
+    if errors:
+        lines.append("")
+        lines.append("⚠️ Не принято:")
+        lines.extend(f"• {html.escape(e)}" for e in errors)
+    ready = bool(d["items"]) and bool(d["shots"])
+    lines.append("")
+    lines.append("Готово — жмите «Отправить»." if ready else "Отправить можно, когда есть и список, и скрины.")
+    return "\n".join(lines)
+
+
+def request_kb(d: dict) -> InlineKeyboardMarkup:
+    rows = []
+    if d["items"] and d["shots"]:
+        rows.append([InlineKeyboardButton(text="📤 Отправить админам", callback_data="req_send")])
+    rows.append([
+        InlineKeyboardButton(text="🗑 Сбросить", callback_data="req_reset"),
+        InlineKeyboardButton(text="✖ Отмена", callback_data="req_cancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _refresh_request_summary(chat_id: int, user_id: int, errors: list[str]):
+    """Через короткую паузу (чтобы альбом из нескольких фото дал ОДНО обновление,
+    а не по сообщению на каждое фото) показывает/обновляет сводку заявки."""
+    try:
+        await asyncio.sleep(0.8)
+    except asyncio.CancelledError:
+        return
+    d = REQUEST_DRAFTS.get(user_id)
+    if d is None:
+        return
+    text, kb = request_summary_text(d, errors), request_kb(d)
+    old = d.get("summary")
+    if old:
+        try:
+            await bot.edit_message_text(text, chat_id=old[0], message_id=old[1],
+                                        reply_markup=kb, parse_mode="HTML")
+            return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+        except Exception:
+            pass
+    try:
+        sent = await bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
+        d["summary"] = (sent.chat.id, sent.message_id)
+        remember_owner(sent.chat.id, sent.message_id, user_id)
+    except Exception as e:
+        log.warning("Не удалось показать сводку заявки: %s", e)
+
+
+def _schedule_summary(chat_id: int, user_id: int, errors: list[str]):
+    prev = _REQUEST_TASKS.get(user_id)
+    if prev and not prev.done():
+        prev.cancel()
+    _REQUEST_TASKS[user_id] = asyncio.create_task(_refresh_request_summary(chat_id, user_id, errors))
+
+
+def _count_open_requests(user_id: int) -> int:
+    conn = db()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM orders WHERE user_id=? AND status='pending' AND payload LIKE '%\"bundle\"%'",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return int(row["c"])
+
+
+@dp.message(Command("request"))
+@dp.message(F.text.func(lambda t: _normalize_ru(t) in {"заявка", "заявка админам", "новая заявка"} if t else False))
+async def cmd_request(message: Message):
+    u = message.from_user
+    user = get_or_create_user(u.id, u.username or "", u.full_name)
+    if message.chat.type != "private":
+        await reply_or_send(message, "📨 Заявки принимаются только в личке — напишите мне «заявка» в личные сообщения.")
+        return
+    if user["pending_action"] in ("tame", "rename"):
+        await reply_or_send(message, "Сначала завершите ввод имени питомца (или ответьте на запрос имени).")
+        return
+    if _count_open_requests(u.id) >= REQUEST_MAX_OPEN_PER_USER:
+        await reply_or_send(message, f"У вас уже {REQUEST_MAX_OPEN_PER_USER} необработанных заявки — дождитесь ответа админов.")
+        return
+    REQUEST_DRAFTS[u.id] = {"items": [], "shots": [], "note": [], "summary": None}
+    update_user(u.id, pending_action="request", pending_msg_id=None, pending_chat_id=message.chat.id, pending_name=None)
+    await reply_or_send(message, request_help_text(), parse_mode="HTML")
+
+
+def _add_text_to_draft(d: dict, text: str) -> list[str]:
+    errors: list[str] = []
+    for line in text.splitlines():
+        item, err = parse_request_line(line)
+        if err:
+            errors.append(err)
+        elif item:
+            if len(d["items"]) >= REQUEST_MAX_ITEMS:
+                errors.append(f"максимум {REQUEST_MAX_ITEMS} предметов в одной заявке")
+                break
+            d["items"].append(item)
+    return errors
+
+
+async def request_handle_text(message: Message, user):
+    u = message.from_user
+    if message.chat.type != "private":
+        return  # заявка собирается только в личке; в группах молчим
+    if _normalize_ru(message.text) in {"отмена", "отменить"}:
+        clear_pending(u.id)
+        REQUEST_DRAFTS.pop(u.id, None)
+        await reply_or_send(message, "✖ Заявка отменена.")
+        return
+    d = _draft(u.id)
+    errors = _add_text_to_draft(d, message.text or "")
+    _schedule_summary(message.chat.id, u.id, errors)
+
+
+@dp.message(F.chat.type == "private", F.photo | F.document)
+async def handle_request_media(message: Message):
+    u = message.from_user
+    if u is None or u.id not in PENDING_USERS:
+        return
+    user = get_or_create_user(u.id, u.username or "", u.full_name)
+    if user["pending_action"] != "request":
+        return
+    d = _draft(u.id)
+    errors: list[str] = []
+    if message.photo:
+        shot = {"k": "photo", "id": message.photo[-1].file_id}
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        shot = {"k": "doc", "id": message.document.file_id}
+    else:
+        await reply_or_send(message, "Нужны скриншоты — пришлите картинку (фото или файл-изображение).")
+        return
+    if any(x["id"] == shot["id"] for x in d["shots"]):
+        pass
+    elif len(d["shots"]) >= REQUEST_MAX_SHOTS:
+        errors.append(f"максимум {REQUEST_MAX_SHOTS} скринов")
+    else:
+        d["shots"].append(shot)
+    if message.caption:
+        errors.extend(_add_text_to_draft(d, message.caption))
+    _schedule_summary(message.chat.id, u.id, errors)
+
+
+@dp.callback_query(F.data == "req_reset")
+async def cb_req_reset(callback: CallbackQuery):
+    u = callback.from_user
+    d = REQUEST_DRAFTS.get(u.id)
+    if d is None:
+        await callback.answer("Заявка не начата. Напишите «заявка».", show_alert=True)
+        return
+    d["items"].clear()
+    d["shots"].clear()
+    await safe_edit_or_send(callback.message, request_summary_text(d), request_kb(d),
+                            owner_id=u.id, parse_mode="HTML")
+    await callback.answer("Список и скрины очищены")
+
+
+@dp.callback_query(F.data == "req_cancel")
+async def cb_req_cancel(callback: CallbackQuery):
+    u = callback.from_user
+    user = get_or_create_user(u.id, u.username or "", u.full_name)
+    if user["pending_action"] == "request":
+        clear_pending(u.id)
+    REQUEST_DRAFTS.pop(u.id, None)
+    await safe_edit_or_send(callback.message, "✖ Заявка отменена.", None, owner_id=u.id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "req_send")
+async def cb_req_send(callback: CallbackQuery):
+    u = callback.from_user
+    user = get_or_create_user(u.id, u.username or "", u.full_name)
+    d = REQUEST_DRAFTS.pop(u.id, None)
+    if d is None or user["pending_action"] != "request":
+        await callback.answer("Заявка не найдена. Напишите «заявка».", show_alert=True)
+        return
+    if not d["items"]:
+        REQUEST_DRAFTS[u.id] = d
+        await callback.answer("Список пуст — пришлите предметы текстом.", show_alert=True)
+        return
+    if not d["shots"]:
+        REQUEST_DRAFTS[u.id] = d
+        await callback.answer("Скриншоты обязательны — приложите хотя бы один.", show_alert=True)
+        return
+    if not get_all_admin_ids():
+        REQUEST_DRAFTS[u.id] = d
+        await callback.answer("Сейчас нет админов, которым можно отправить заявку.", show_alert=True)
+        return
+    payload = {"type": "bundle", "items": d["items"], "shots": d["shots"]}
+    clear_pending(u.id)
+    order_id = _insert_order(user, f"Заявка: {len(d['items'])} предм.", payload)
+    await safe_edit_or_send(
+        callback.message,
+        f"✅ Заявка #{order_id} отправлена админам ({len(d['items'])} предм., скринов: {len(d['shots'])}).\n"
+        "Когда её обработают — я сообщу вам здесь.",
+        None, owner_id=u.id,
+    )
+    await callback.answer()
+    await notify_admins_bundle(order_id, user, payload)
+
+
+# =========================================================
 #  ФОНОВЫЕ ЗАДАЧИ
 # =========================================================
 
@@ -4372,12 +5056,23 @@ async def _bg_gather(coros: list):
         await asyncio.gather(*(_bg_run(c) for c in coros))
 
 
-async def resolve_finished_activities():
+def _fetch_rows_sync(sql: str):
     conn = db()
-    rows = conn.execute(
-        "SELECT * FROM pets WHERE busy_until IS NOT NULL AND alive=1"
-    ).fetchall()
-    conn.close()
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+async def _fetch_rows(sql: str):
+    """ОПТИМИЗАЦИЯ (отклик): периодические выборки по всем питомцам (каждые
+    30 с, 4 штуки) шли прямо в потоке бота и на время запроса замораживали
+    ответы игрокам. Теперь выполняются в отдельном потоке."""
+    return await asyncio.to_thread(_fetch_rows_sync, sql)
+
+
+async def resolve_finished_activities():
+    rows = await _fetch_rows("SELECT * FROM pets WHERE busy_until IS NOT NULL AND alive=1")
 
     now = datetime.utcnow()
     tasks = []
@@ -4532,13 +5227,38 @@ async def resolve_activity(pet: sqlite3.Row):
     try:
         sent = await bot.send_message(
             user_id,
-            f"🐺 «{pet['name']}» возвращается {label} и остановился у следов на земле...\n"
-            "Чьи это следы? Угадаете — получите бонус к добыче, опыту и меньше устанете:",
+            f"🐺 «{html.escape(pet['name'] or '')}» возвращается {label} и остановился у следов на земле...\n"
+            "Чьи это следы? Угадаете — получите бонус к добыче, опыту и меньше устанете.\n\n"
+            + build_track_clue(correct)
+            + "\n\n<i>Справка по следам: «следы»</i>",
             reply_markup=activity_game_kb(user_id),
+            parse_mode="HTML",
         )
         remember_owner(sent.chat.id, sent.message_id, user_id)
     except Exception as e:
         log.warning("Не удалось отправить мини-игру пользователю %s: %s", user_id, e)
+
+
+
+def build_track_clue(correct: str) -> str:
+    """HTML-текст с моно-схемой следа и двумя уликами правильного зверя."""
+    info = TRACK_INFO[correct]
+    # общая улика бывает у двух зверей (копытные), поэтому добавляем ещё и
+    # решающую — вместе они указывают ровно на одного
+    clues = [random.choice(info["shared"]), random.choice(info["unique"])]
+    random.shuffle(clues)
+    clue_lines = "\n".join(f"• {html.escape(c)}" for c in clues)
+    return f"<pre>{html.escape(info['art'])}</pre>\n🔎 Улики:\n{clue_lines}"
+
+
+def tracks_guide_text() -> str:
+    parts = ["🐾 <b>КАК ЧИТАТЬ СЛЕДЫ</b>"]
+    icons = {"заяц": "🐇 Заяц", "олень": "🦌 Олень", "кабан": "🐗 Кабан"}
+    for key, info in TRACK_INFO.items():
+        parts.append(f"\n{icons[key]}\n<pre>{html.escape(info['art'])}</pre>")
+        parts.extend(f"• {html.escape(c)}" for c in info["unique"][:2])
+    parts.append("\nКопытные (олень и кабан) похожи размером — смотрите на форму копыта и боковые пальцы.")
+    return "\n".join(parts)
 
 
 def activity_game_kb(user_id: int) -> InlineKeyboardMarkup:
@@ -4629,6 +5349,11 @@ async def _finalize_activity_result(pet: sqlite3.Row, won: bool | None, note_ext
         log.warning("Не удалось уведомить пользователя %s: %s", user_id, e)
 
 
+@dp.message(F.text.func(lambda t: _normalize_ru(t) in {"следы", "следы в лесу"} if t else False))
+async def cmd_tracks_guide(message: Message):
+    await reply_or_send(message, tracks_guide_text(), parse_mode="HTML")
+
+
 @dp.callback_query(F.data.startswith("actgame_"))
 async def cb_activity_game_answer(callback: CallbackQuery):
     rest = callback.data[len("actgame_"):]
@@ -4655,9 +5380,7 @@ async def cb_activity_game_answer(callback: CallbackQuery):
 async def resolve_stale_activity_games():
     """Если игрок не ответил на мини-игру "чей след?" за GAME_TIMEOUT_SECONDS —
     результат похода забирается автоматически, без бонуса за угадывание."""
-    conn = db()
-    rows = conn.execute("SELECT * FROM pets WHERE game_pending=1 AND alive=1").fetchall()
-    conn.close()
+    rows = await _fetch_rows("SELECT * FROM pets WHERE game_pending=1 AND alive=1")
 
     now = datetime.utcnow()
     tasks = []
@@ -4672,11 +5395,7 @@ async def resolve_stale_activity_games():
 
 
 async def resolve_finished_campfires():
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM pets WHERE cooking_until IS NOT NULL"
-    ).fetchall()
-    conn.close()
+    rows = await _fetch_rows("SELECT * FROM pets WHERE cooking_until IS NOT NULL")
 
     now = datetime.utcnow()
     tasks = []
@@ -4702,11 +5421,7 @@ async def _notify_campfire_ready(user_id: int, output: int):
 
 
 async def check_starvation_deaths():
-    conn = db()
-    rows = conn.execute(
-        "SELECT * FROM pets WHERE alive=1 AND satiety<=0"
-    ).fetchall()
-    conn.close()
+    rows = await _fetch_rows("SELECT * FROM pets WHERE alive=1 AND satiety<=0")
 
     now = datetime.utcnow()
     tasks = []
@@ -4744,29 +5459,95 @@ async def _notify_starvation_death(user_id: int, pet_name: str):
 # (лес/охота/арена/зелья/костёр/магазин и т.п.) — иначе aiogram отдаёт ему
 # сообщение первым и до конкретных команд дело просто не доходит (баг ).
 
+_BOT_ID: int | None = None
+
+
+async def _get_bot_id() -> int:
+    global _BOT_ID
+    if _BOT_ID is None:
+        _BOT_ID = (await bot.me()).id
+    return _BOT_ID
+
+
+def _clean_pet_name(raw: str | None) -> str:
+    """Имя питомца: без переводов строк/управляющих символов, схлопнутые
+    пробелы, максимум 24 символа."""
+    if not raw:
+        return ""
+    name = re.sub(r"[\u0000-\u001f\u007f\u200b-\u200f\u2028-\u202e\ufeff]", " ", raw)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name[:24].strip()
+
+
+async def _is_reply_to_pending_prompt(message: Message, user) -> bool:
+    """БАГФИКС: раньше проверка была `pending_msg_id and reply != pending_msg_id` —
+    если id запроса почему-то не был сохранён (например, после «не воскрешать»),
+    имя записывалось из ЛЮБОГО реплая, даже на сообщение другого человека.
+    Теперь реплай обязан быть именно на сообщение ЭТОГО бота, в том же чате и
+    (если id запроса известен) именно на сообщение-запрос."""
+    reply = message.reply_to_message
+    if reply is None or reply.from_user is None:
+        return False
+    if reply.from_user.id != await _get_bot_id():
+        return False
+    chat_id = user["pending_chat_id"]
+    if chat_id and chat_id != message.chat.id:
+        return False
+    pending_msg_id = user["pending_msg_id"]
+    if pending_msg_id and reply.message_id != pending_msg_id:
+        return False
+    return True
+
+
+def name_confirm_kb(rename: bool) -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton(text="✅ Да, это имя", callback_data="name_ok"),
+        InlineKeyboardButton(text="✏️ Другое", callback_data="name_redo"),
+    ]]
+    if rename:
+        rows.append([InlineKeyboardButton(text="✖ Отмена", callback_data="name_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def name_confirm_text(pending: str, name: str, old_name: str | None) -> str:
+    safe = html.escape(name)
+    if pending == "rename":
+        return (
+            f"✏️ Переименовать питомца «{html.escape(old_name or '—')}» в «<b>{safe}</b>»?\n"
+            f"С вас спишется {RENAME_COST_RUNES} 🀄 рун.\n\n"
+            "Подтвердите кнопкой или ответьте на это сообщение другим именем."
+        )
+    return (
+        f"🐺 Назвать питомца «<b>{safe}</b>»?\n"
+        "Имя запишется только после подтверждения.\n\n"
+        "Подтвердите кнопкой или ответьте на это сообщение другим именем."
+    )
+
+
 @dp.message(F.text & ~F.text.startswith("/") & ~F.text.startswith("!"))
 async def handle_pending_text(message: Message):
-    """Ловит имя питомца, если пользователь в состоянии 'tame' или 'rename'.
-    Если пользователь ни в каком ожидании не находится — просто ничего не делает
-    (остальные точные текстовые команды уже перехвачены хендлерами выше)."""
+    """Ловит имя питомца, если пользователь в состоянии 'tame' или 'rename'
+    (или текст заявки админам, если он в состоянии 'request').
+    Если пользователь ни в каком ожидании не находится — не делает НИЧЕГО и
+    не трогает базу (остальные точные текстовые команды уже перехвачены выше)."""
     u = message.from_user
+    if u is None or u.id not in PENDING_USERS:
+        return
     user = get_or_create_user(u.id, u.username or "", u.full_name)
     pending = user["pending_action"]
     if not pending:
+        PENDING_USERS.discard(u.id)
         return
 
-    # имя питомца засчитывается только реплаем на сообщение-запрос,
-    # чтобы случайные сообщения в чате не улетали в качестве имени
-    pending_msg_id = user["pending_msg_id"]
-    if not message.reply_to_message or (
-        pending_msg_id and message.reply_to_message.message_id != pending_msg_id
-    ):
-        # БАГФИКС (флуд): раньше это напоминание срабатывало на КАЖДОЕ обычное
-        # сообщение пользователя в чате, пока он не назовёт питомца — в группе
-        # это превращалось в спам при любой не относящейся к делу переписке.
-        # Теперь: 1) в группах вообще молчим на посторонние сообщения (инструкция
-        # уже была в исходном запросе на имя), 2) даже в личке — не чаще
-        # раза в PENDING_NUDGE_COOLDOWN.
+    if pending == "request":
+        await request_handle_text(message, user)
+        return
+
+    # имя питомца засчитывается только реплаем на сообщение-запрос бота,
+    # чтобы случайные сообщения/реплаи в чате не улетали в качестве имени
+    if not await _is_reply_to_pending_prompt(message, user):
+        # в группах молчим на посторонние сообщения (инструкция уже была в
+        # запросе), в личке напоминаем не чаще раза в PENDING_NUDGE_COOLDOWN
         if message.chat.type != "private":
             return
         last_nudge = _last_pending_nudge.get(u.id)
@@ -4774,29 +5555,105 @@ async def handle_pending_text(message: Message):
         if last_nudge and (now - last_nudge) < PENDING_NUDGE_COOLDOWN:
             return
         _last_pending_nudge[u.id] = now
-        await reply_or_send(message, "Пожалуйста, ответьте (реплаем) на сообщение с запросом имени.")
+        await reply_or_send(message, "Пожалуйста, ответьте (реплаем) на сообщение бота с запросом имени.")
         return
 
-    name = message.text.strip()[:24] if message.text else ""
+    name = _clean_pet_name(message.text)
     if not name:
         await reply_or_send(message, "Имя не может быть пустым. Попробуйте ещё раз.")
         return
 
-    if pending == "tame":
-        create_new_pet(u.id, name)
-        update_user(u.id, pending_action=None, pending_msg_id=None)
-        await reply_or_send(message, f"🐺 Питомец «{name}» успешно приручён!")
-        await send_pet_screen(message.chat.id, u.id)
-
-    elif pending == "rename":
-        fresh_user = get_or_create_user(u.id, u.username or "", u.full_name)
-        if fresh_user["runes"] < RENAME_COST_RUNES:
-            update_user(u.id, pending_action=None, pending_msg_id=None)
+    old_name = None
+    if pending == "rename":
+        pet = get_pet(u.id)
+        old_name = pet["name"] if pet else None
+        if user["runes"] < RENAME_COST_RUNES:
+            clear_pending(u.id)
             await reply_or_send(message, "Недостаточно рун, переименование отменено.")
             return
-        update_user(u.id, runes=fresh_user["runes"] - RENAME_COST_RUNES, pending_action=None, pending_msg_id=None)
-        update_pet(u.id, name=name)
-        await reply_or_send(message, f"✅ Питомца теперь зовут «{name}»")
+
+    # ПОДТВЕРЖДЕНИЕ: имя пока никуда не записывается — только показываем
+    # кандидата и ждём «Да». Новое сообщение-подтверждение становится
+    # «сообщением-запросом», так что на него же можно ответить другим именем.
+    sent = await reply_or_send(
+        message, name_confirm_text(pending, name, old_name),
+        reply_markup=name_confirm_kb(pending == "rename"), parse_mode="HTML",
+    )
+    remember_owner(sent.chat.id, sent.message_id, u.id)
+    update_user(u.id, pending_name=name, pending_msg_id=sent.message_id, pending_chat_id=sent.chat.id)
+
+
+@dp.callback_query(F.data == "name_ok")
+async def cb_name_ok(callback: CallbackQuery):
+    u = callback.from_user
+    user = get_or_create_user(u.id, u.username or "", u.full_name)
+    pending = user["pending_action"]
+    name = user["pending_name"]
+    msg = callback.message
+    if pending not in ("tame", "rename") or not name or (
+        msg is not None and user["pending_msg_id"] and msg.message_id != user["pending_msg_id"]
+    ):
+        await callback.answer("Это подтверждение уже неактуально. Напишите «волк».", show_alert=True)
+        return
+
+    if pending == "tame":
+        pet = get_pet(u.id)
+        if pet is not None and pet["alive"]:
+            clear_pending(u.id)
+            await callback.answer("У вас уже есть живой питомец.", show_alert=True)
+            return
+        create_new_pet(u.id, name)
+        clear_pending(u.id)
+        text = f"🐺 Питомец «{html.escape(name)}» успешно приручён!"
+        await safe_edit_or_send(msg, text, None, owner_id=u.id, parse_mode="HTML")
+        await callback.answer()
+        await send_pet_screen(msg.chat.id, u.id)
+        return
+
+    # rename
+    pet = get_pet(u.id)
+    if pet is None or not pet["alive"]:
+        clear_pending(u.id)
+        await callback.answer("Сначала приручите волка", show_alert=True)
+        return
+    if user["runes"] < RENAME_COST_RUNES:
+        clear_pending(u.id)
+        await safe_edit_or_send(msg, "Недостаточно рун, переименование отменено.", None, owner_id=u.id)
+        await callback.answer()
+        return
+    update_user(u.id, runes=user["runes"] - RENAME_COST_RUNES)
+    clear_pending(u.id)
+    update_pet(u.id, name=name)
+    await safe_edit_or_send(msg, f"✅ Питомца теперь зовут «{html.escape(name)}»", None,
+                            owner_id=u.id, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "name_redo")
+async def cb_name_redo(callback: CallbackQuery):
+    u = callback.from_user
+    user = get_or_create_user(u.id, u.username or "", u.full_name)
+    if user["pending_action"] not in ("tame", "rename"):
+        await callback.answer("Это подтверждение уже неактуально. Напишите «волк».", show_alert=True)
+        return
+    update_user(u.id, pending_name=None, pending_msg_id=callback.message.message_id,
+                pending_chat_id=callback.message.chat.id)
+    await safe_edit_or_send(
+        callback.message,
+        "✏️ Хорошо. Пришлите другое имя ОТВЕТОМ (реплаем) на это сообщение.",
+        None, owner_id=u.id,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "name_cancel")
+async def cb_name_cancel(callback: CallbackQuery):
+    u = callback.from_user
+    user = get_or_create_user(u.id, u.username or "", u.full_name)
+    if user["pending_action"] == "rename":
+        clear_pending(u.id)
+    await safe_edit_or_send(callback.message, "✖ Переименование отменено. Руны не списаны.", None, owner_id=u.id)
+    await callback.answer()
 
 
 # =========================================================
@@ -4821,9 +5678,15 @@ async def global_error_handler(event):
 
 async def main():
     init_db()
+    load_pending_users()
+    try:
+        await _get_bot_id()
+    except Exception as e:
+        log.warning("Не удалось заранее получить id бота (получим при первом использовании): %s", e)
     asyncio.create_task(background_loop())
     log.info("Бот запущен, начинаем polling...")
-    await dp.start_polling(bot)
+    # allowed_updates — не получаем лишние типы апдейтов, которые бот всё равно не обрабатывает
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
