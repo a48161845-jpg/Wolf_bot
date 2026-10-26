@@ -785,6 +785,52 @@ def update_pet(user_id: int, **fields):
     upsert_pet(user_id, **fields)
 
 
+# БАГФИКС: раньше ресурсы писались как "значение из старого снимка + прирост",
+# и параллельные операции (передача, костёр, возврат из леса) затирали друг друга.
+# Теперь прирост считается прямо в SQL — на актуальном значении в БД.
+_PET_RESOURCE_COLS = {"firewood", "raw_meat", "cooked_meat", "bones"}
+
+
+def add_pet_resources(user_id: int, min_required: dict | None = None, **deltas) -> bool:
+    """Атомарно меняет ресурсы питомца на дельты (могут быть отрицательными).
+    min_required={"firewood": 0.25} — применять, только если на момент записи
+    ресурса хватает; возвращает False, если условие не выполнилось."""
+    for col in deltas:
+        if col not in _PET_RESOURCE_COLS:
+            raise ValueError(f"недопустимая колонка ресурса: {col}")
+    if not deltas:
+        return True
+    sets = ", ".join(
+        f"{c}=ROUND(COALESCE({c},0)+?, 2)" if c == "firewood" else f"{c}=COALESCE({c},0)+?"
+        for c in deltas
+    )
+    where, params = ["user_id=?"], [*deltas.values(), user_id]
+    for col, need in (min_required or {}).items():
+        if col not in _PET_RESOURCE_COLS:
+            raise ValueError(f"недопустимая колонка ресурса: {col}")
+        where.append(f"COALESCE({col},0)>=?")
+        params.append(need)
+    conn = db()
+    try:
+        cur = conn.execute(f"UPDATE pets SET {sets} WHERE {' AND '.join(where)}", params)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def claim_activity_game(user_id: int) -> bool:
+    """Атомарно «забирает» результат мини-игры: True получит только один вызывающий
+    (ответ игрока или авто-таймаут), второй увидит False и ничего не начислит."""
+    conn = db()
+    try:
+        cur = conn.execute("UPDATE pets SET game_pending=0 WHERE user_id=? AND game_pending=1", (user_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 # Кто сейчас «чего-то ждёт» (имя питомца / заявка админам). Хранится и в БД,
 # но здесь — копия в памяти: хендлер обычного текста раньше лез в БД на КАЖДОЕ
 # сообщение в каждом чате, чтобы узнать, ждём ли мы от автора имя питомца.
@@ -1004,6 +1050,7 @@ GAME_TIMEOUT_SECONDS = 10 * 60     # если не ответил за 10 мин
 # По запросу: расход дров теперь случайный при каждой готовке (от 0.25 до 2)
 CAMPFIRE_WOOD_COST_MIN, CAMPFIRE_WOOD_COST_MAX = 0.25, 2.0
 CAMPFIRE_MEAT_COST = 1
+CAMPFIRE_WOOD_MIN_TO_COOK = 0.01  # минимальный остаток дров, на котором ещё можно жарить
 CAMPFIRE_COOK_SECONDS = 20 * 60
 CAMPFIRE_MEAT_OUTPUT_MIN, CAMPFIRE_MEAT_OUTPUT_MAX = 1, 1
 
@@ -1678,7 +1725,7 @@ def pet_text(pet: sqlite3.Row, satiety_now: int) -> str:
         f"⚖️ Вес: {pet['weight']:.1f} / {MAX_PET_WEIGHT:.0f} кг\n"
         f"🥩 Сытость: {satiety_now}%\n"
         f"🦴 Косточки: {pet['bones']}\n"
-        f"🪵 Дрова: {pet['firewood']:.1f}   🥩 Плоть: {pet['raw_meat']}   🍖 Готового мяса: {pet['cooked_meat']}"
+        f"🪵 Дрова: {pet['firewood']:.2f}   🥩 Плоть: {pet['raw_meat']}   🍖 Готового мяса: {pet['cooked_meat']}"
     )
 
 
@@ -2426,8 +2473,11 @@ async def cmd_transfer(message: Message):
         if target_pet is None or not target_pet["alive"]:
             await reply_or_send(message, "❌ У получателя нет живого питомца — нельзя передать этот ресурс.")
             return
-        update_pet(u.id, **{resource: sender_pet[resource] - amount})
-        update_pet(target_id, **{resource: target_pet[resource] + amount})
+        # атомарно: списание проверяет остаток в момент записи, зачисление — прирост в SQL
+        if not add_pet_resources(u.id, min_required={resource: amount}, **{resource: -amount}):
+            await reply_or_send(message, f"❌ У вас недостаточно ресурса «{name_ru}».")
+            return
+        add_pet_resources(target_id, **{resource: amount})
     else:
         sender_user = get_or_create_user(u.id, u.username or "", u.full_name)
         if sender_user[resource] < amount:
@@ -3877,9 +3927,12 @@ async def cb_campfire_cook(callback: CallbackQuery):
     if pet["cooking_until"] and datetime.utcnow() < datetime.fromisoformat(pet["cooking_until"]):
         await callback.answer("Мясо уже готовится на костре", show_alert=True)
         return
-    if pet["firewood"] < CAMPFIRE_WOOD_COST_MIN or pet["raw_meat"] < CAMPFIRE_MEAT_COST:
+    # БАГФИКС: раньше остаток дров < 0.25 был "мёртвым" — его нельзя было потратить.
+    # Теперь костёр можно разжечь на любом остатке >= 0.01: тратится
+    # min(случайная цена, всё что есть).
+    if pet["firewood"] < CAMPFIRE_WOOD_MIN_TO_COOK or pet["raw_meat"] < CAMPFIRE_MEAT_COST:
         await callback.answer(
-            f"Не хватает ресурсов! Нужно хотя бы {CAMPFIRE_WOOD_COST_MIN} 🪵 дров и {CAMPFIRE_MEAT_COST} 🥩 плоти.",
+            f"Не хватает ресурсов! Нужны дрова 🪵 (остаток: {pet['firewood']:.2f}) и {CAMPFIRE_MEAT_COST} 🥩 плоти.",
             show_alert=True,
         )
         return
@@ -3887,13 +3940,18 @@ async def cb_campfire_cook(callback: CallbackQuery):
     # По запросу: расход дров на готовку теперь случайный каждый раз (0.25–2),
     # но не больше, чем реально есть у игрока
     wood_cost = round(min(random.uniform(CAMPFIRE_WOOD_COST_MIN, CAMPFIRE_WOOD_COST_MAX), pet["firewood"]), 2)
-    cooking_until = datetime.utcnow() + timedelta(seconds=CAMPFIRE_COOK_SECONDS)
-    update_pet(
+    wood_cost = max(wood_cost, CAMPFIRE_WOOD_MIN_TO_COOK)
+    # атомарное списание: если за это время ресурсы ушли (двойной клик/передача) — не готовим
+    if not add_pet_resources(
         u.id,
-        firewood=pet["firewood"] - wood_cost,
-        raw_meat=pet["raw_meat"] - CAMPFIRE_MEAT_COST,
-        cooking_until=cooking_until.isoformat(),
-    )
+        min_required={"firewood": max(0.0, wood_cost - 0.005), "raw_meat": CAMPFIRE_MEAT_COST},
+        firewood=-wood_cost,
+        raw_meat=-CAMPFIRE_MEAT_COST,
+    ):
+        await callback.answer("Не хватает ресурсов!", show_alert=True)
+        return
+    cooking_until = datetime.utcnow() + timedelta(seconds=CAMPFIRE_COOK_SECONDS)
+    update_pet(u.id, cooking_until=cooking_until.isoformat())
     # уведомление всплывающим сообщением сверху экрана, без флуда в чате
     await callback.answer(
         f"🔥 Костёр разожжён! Потрачено {wood_cost:.2f} 🪵 дров. "
@@ -3919,11 +3977,7 @@ async def cb_campfire_potion_cook(callback: CallbackQuery):
         await callback.answer("Нет сырого мяса для готовки.", show_alert=True)
         return
     add_potion(u.id, "cooking", -1)
-    update_pet(
-        u.id,
-        raw_meat=pet["raw_meat"] - 1,
-        cooked_meat=pet["cooked_meat"] + POTION_COOKING_OUTPUT,
-    )
+    add_pet_resources(u.id, raw_meat=-1, cooked_meat=POTION_COOKING_OUTPUT)
     record_quest_progress(u.id, "cook_meat", POTION_COOKING_OUTPUT)
     await callback.answer(
         f"🧪🔥 Зелье жарки использовано! Мгновенно получено {POTION_COOKING_OUTPUT} 🍖 готового мяса, дрова не потрачены.",
@@ -5273,6 +5327,11 @@ async def _finalize_activity_result(pet: sqlite3.Row, won: bool | None, note_ext
     won=True — угадал (бонус), won=False — не угадал (без бонуса),
     won=None — не ответил вовремя, результат забирается автоматически."""
     user_id = pet["user_id"]
+    # БАГФИКС: защита от двойного зачёта (клик по кнопке + авто-таймаут одновременно)
+    if not claim_activity_game(user_id):
+        return
+    # и от устаревшего снимка: дальше работаем со свежей строкой из БД
+    pet = get_pet(user_id) or pet
     payload = json.loads(pet["game_payload"])
     raw_meat_gain = payload["raw_meat_gain"]
     firewood_gain = payload["firewood_gain"]
@@ -5302,11 +5361,14 @@ async def _finalize_activity_result(pet: sqlite3.Row, won: bool | None, note_ext
         game_note = "\n⏰ Вы не успели ответить — результат забран автоматически, без бонуса."
 
     grant_pet_xp(pet, xp_gain)
+    add_pet_resources(
+        user_id,
+        firewood=firewood_gain,
+        raw_meat=raw_meat_gain,
+        bones=bones_gain - bones_spent,
+    )
     update_pet(
         user_id,
-        firewood=pet["firewood"] + firewood_gain,
-        raw_meat=pet["raw_meat"] + raw_meat_gain,
-        bones=pet["bones"] - bones_spent + bones_gain,
         weight=max(1.0, pet["weight"] - weight_loss),
         satiety=new_satiety,
         game_pending=0,
@@ -5404,7 +5466,8 @@ async def resolve_finished_campfires():
         if now < until:
             continue
         output = random.randint(CAMPFIRE_MEAT_OUTPUT_MIN, CAMPFIRE_MEAT_OUTPUT_MAX)
-        update_pet(pet["user_id"], cooked_meat=pet["cooked_meat"] + output, cooking_until=None)
+        add_pet_resources(pet["user_id"], cooked_meat=output)
+        update_pet(pet["user_id"], cooking_until=None)
         record_quest_progress(pet["user_id"], "cook_meat", output)
         tasks.append(_notify_campfire_ready(pet["user_id"], output))
     await _bg_gather(tasks)
