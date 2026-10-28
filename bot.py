@@ -590,7 +590,6 @@ def _create_indexes(conn: sqlite3.Connection):
     и поиск игрока по @username иначе делают полный скан таблицы, что с ростом
     базы становится всё медленнее."""
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pets_busy_alive ON pets(busy_until, alive)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_pets_game_pending ON pets(game_pending, alive)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pets_alive_satiety ON pets(alive, satiety)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pets_cooking ON pets(cooking_until)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_pets_arena ON pets(in_arena, alive, busy_until)")
@@ -653,11 +652,6 @@ def _migrate_columns(conn: sqlite3.Connection):
             "pending_potion_strength": "INTEGER DEFAULT 0",
             "pending_potion_speed": "INTEGER DEFAULT 0",
             "pending_potion_loot": "INTEGER DEFAULT 0",
-            # мини-игра "чей след?" при возвращении из леса/охоты
-            "game_pending": "INTEGER DEFAULT 0",
-            "game_correct": "TEXT",
-            "game_payload": "TEXT",
-            "game_offered_at": "TEXT",
         },
     }
     cur = conn.cursor()
@@ -819,18 +813,6 @@ def add_pet_resources(user_id: int, min_required: dict | None = None, **deltas) 
         conn.close()
 
 
-def claim_activity_game(user_id: int) -> bool:
-    """Атомарно «забирает» результат мини-игры: True получит только один вызывающий
-    (ответ игрока или авто-таймаут), второй увидит False и ничего не начислит."""
-    conn = db()
-    try:
-        cur = conn.execute("UPDATE pets SET game_pending=0 WHERE user_id=? AND game_pending=1", (user_id,))
-        conn.commit()
-        return cur.rowcount > 0
-    finally:
-        conn.close()
-
-
 # Кто сейчас «чего-то ждёт» (имя питомца / заявка админам). Хранится и в БД,
 # но здесь — копия в памяти: хендлер обычного текста раньше лез в БД на КАЖДОЕ
 # сообщение в каждом чате, чтобы узнать, ждём ли мы от автора имя питомца.
@@ -980,70 +962,6 @@ FOREST_WEIGHT_LOSS_MIN, FOREST_WEIGHT_LOSS_MAX = 0.15, 0.35
 HUNT_WEIGHT_LOSS_MIN, HUNT_WEIGHT_LOSS_MAX = 0.25, 0.55
 AMBUSH_EXTRA_WEIGHT_LOSS_DEFENDED = 0.1   # отбились косточками — тоже устали
 AMBUSH_EXTRA_WEIGHT_LOSS_FLED = 0.25       # убегали в панике — потеряли больше веса
-
-# =========================================================
-#  МИНИ-ИГРА "ЧЕЙ СЛЕД?" — при возвращении из леса/охоты
-# =========================================================
-# По запросу: добавлена мини-игра в лес/охоту. Пока волк "идёт обратно",
-# игроку показываются 3 варианта следов на земле — угадавшему даётся бонус
-# к добыче/опыту и меньшая потеря веса. Если игрок не ответит вовремя —
-# результат забирается автоматически, без бонуса (см. resolve_stale_activity_games).
-ANIMAL_TRACK_LABELS = {
-    "заяц": "🐇 Заяц",
-    "олень": "🦌 Олень",
-    "кабан": "🐗 Кабан",
-}
-
-# --- ПОДСКАЗКИ к мини-игре «Чей след?» ---
-# У каждого зверя: схема следа (моно-рисунок), «решающие» улики (только он) и
-# «общие» (подходят ещё кому-то). Игроку показываются схема + 1 общая + 1 решающая
-# улика правильного зверя, так что угадать можно по уликам, а не наугад.
-# Справка по всем следам — команда «следы».
-TRACK_INFO = {
-    "заяц": {
-        "art": " ▪   ▪\n▪▪   ▪▪\n ▪   ▪",
-        "name": "заяц",
-        "unique": [
-            "Следы собраны «четвёркой»: два длинных отпечатка впереди, два маленьких позади.",
-            "Прыжки длинные, а отпечатки вытянутые, без раздвоенных копытец.",
-            "Рядом ни капли глубины в земле — зверь лёгкий, почти не продавливает снег и грязь.",
-        ],
-        "shared": [
-            "След совсем небольшой — меньше ладони.",
-            "Следы идут петлями и резкими поворотами.",
-        ],
-    },
-    "олень": {
-        "art": "◖◗  \n  ◖◗\n◖◗  \n  ◖◗",
-        "name": "олень",
-        "unique": [
-            "Копытца узкие и вытянутые, острыми концами вперёд, шаг ровный и длинный.",
-            "Следы идут шахматной цепочкой, почти по одной линии, без боковых отпечатков.",
-            "Рядом объеденные верхушки веток и молодые побеги на высоте человеческого роста.",
-        ],
-        "shared": [
-            "Отпечаток раздвоенный — два «лепестка» копыта.",
-            "Размер следа примерно с ладонь.",
-        ],
-    },
-    "кабан": {
-        "art": "●● ●●\n●●  ●●\n●● ●●",
-        "name": "кабан",
-        "unique": [
-            "Позади копыт видны два маленьких круглых отпечатка — боковые пальцы.",
-            "Копыта широкие и тупые, след глубокий, земля вокруг взрыта.",
-            "Рядом клочья шерсти на коре и «купальня» — вытоптанная лужа.",
-        ],
-        "shared": [
-            "Отпечаток раздвоенный — два «лепестка» копыта.",
-            "Размер следа примерно с ладонь.",
-        ],
-    },
-}
-
-GAME_WIN_LOOT_BONUS_PERCENT = 25   # +25% к добыче и опыту при угадывании следа
-GAME_WIN_WEIGHT_LOSS_MULT = 0.6    # угадал — меньше устал, вес теряется на 40% меньше
-GAME_TIMEOUT_SECONDS = 10 * 60     # если не ответил за 10 минут — авто-результат без бонуса
 
 # Готовка мяса на костре: 1 мясо + дрова -> немного готового мяса
 # Расход дров при готовке случайный (0.25–2)
@@ -1273,10 +1191,6 @@ async def reply_or_send(message: Message, text: str, **kwargs):
 
 
 def pet_is_busy(pet: sqlite3.Row) -> bool:
-    # питомец также считается занятым, пока не отвечена мини-игра "чей след?"
-    # (иначе можно отправить его в новый поход поверх незавершённого предыдущего)
-    if pet["game_pending"]:
-        return True
     if not pet["busy_until"]:
         return False
     return datetime.utcnow() < datetime.fromisoformat(pet["busy_until"])
@@ -1857,9 +1771,7 @@ async def send_pet_screen(chat_id: int, user_id: int, edit_message: Message | No
     # просто добавляется строка с занятием и временем возвращения.
     busy = pet_is_busy(pet)
     busy_note = ""
-    if pet["game_pending"]:
-        busy_note = "\n\n🐾 Питомец стоит у следов и ждёт вашего ответа в мини-игре «Чей след?» ⬆️"
-    elif busy:
+    if busy:
         until = datetime.fromisoformat(pet["busy_until"])
         remaining = until - datetime.utcnow()
         activity = pet["busy_activity"] or "делах"
@@ -1949,7 +1861,6 @@ async def cmd_help(message: Message):
         "(мясо, дерево, готовое мясо, зелья, руны, ключи, кольца)\n\n"
         "📨 ЗАЯВКА АДМИНАМ (в личке)\n"
         "«заявка» — список предметов + скриншоты, админ выдаёт одной кнопкой\n\n"
-        "🐾 «следы» — как читать следы в лесу (мини-игра «Чей след?»)\n\n"
         "🏪 МАГАЗИН\n"
         "«магазин» — префиксы, скины, зелья, кольца, анти-таргет\n\n"
         "🛠 АДМИНИСТРАЦИЯ (для админов)\n"
@@ -4248,7 +4159,10 @@ async def cb_larets_pick(callback: CallbackQuery):
 @dp.callback_query(F.data == "shop")
 async def cb_shop(callback: CallbackQuery):
     await safe_edit_or_send(callback.message, "🏪 Магазин — выберите раздел:", shop_main_kb(), owner_id=callback.from_user.id)
-    await callback.answer()@dp.message(F.text.lower() == "магазин")
+    await callback.answer()
+
+
+@dp.message(F.text.lower() == "магазин")
 async def cmd_shop_text(message: Message):
     # по запросу: команду "магазин" теперь можно писать прямо в чат
     u = message.from_user
@@ -5079,7 +4993,6 @@ async def background_loop():
     while True:
         await asyncio.sleep(30)
         await resolve_finished_activities()
-        await resolve_stale_activity_games()
         await resolve_finished_campfires()
         await check_starvation_deaths()
 
@@ -5247,9 +5160,6 @@ async def resolve_activity(pet: sqlite3.Row):
             log.warning("Не удалось уведомить пользователя %s: %s", user_id, e)
         return
 
-    # По запросу: мини-игра "чей след?" — вместо немедленного начисления добычи
-    # игроку предлагается угадать след на обратном пути. Угадал — бонус к добыче/опыту
-    # и меньшая потеря веса; результат "заморожен" в game_payload до ответа или таймаута.
     payload = {
         "activity": activity,
         "raw_meat_gain": raw_meat_gain,
@@ -5265,74 +5175,16 @@ async def resolve_activity(pet: sqlite3.Row):
         "bones_spent": bones_spent,
         "pet_name": pet["name"],
     }
-    correct = random.choice(list(ANIMAL_TRACK_LABELS.keys()))
-    now_iso = datetime.utcnow().isoformat()
-    update_pet(
-        user_id,
-        busy_until=None,
-        busy_activity=None,
-        joint_activity_bonus=0,
-        game_pending=1,
-        game_correct=correct,
-        game_payload=json.dumps(payload, ensure_ascii=False),
-        game_offered_at=now_iso,
-    )
-    label = "с охоты" if activity == "охота" else "из леса"
-    try:
-        sent = await bot.send_message(
-            user_id,
-            f"🐺 «{html.escape(pet['name'] or '')}» возвращается {label} и остановился у следов на земле...\n"
-            "Чьи это следы? Угадаете — получите бонус к добыче, опыту и меньше устанете.\n\n"
-            + build_track_clue(correct)
-            + "\n\n<i>Справка по следам: «следы»</i>",
-            reply_markup=activity_game_kb(user_id),
-            parse_mode="HTML",
-        )
-        remember_owner(sent.chat.id, sent.message_id, user_id)
-    except Exception as e:
-        log.warning("Не удалось отправить мини-игру пользователю %s: %s", user_id, e)
+    # сначала освобождаем питомца, затем начисляем добычу
+    update_pet(user_id, busy_until=None, busy_activity=None, joint_activity_bonus=0)
+    await _apply_activity_result(user_id, payload)
 
 
-
-def build_track_clue(correct: str) -> str:
-    """HTML-текст с моно-схемой следа и двумя уликами правильного зверя."""
-    info = TRACK_INFO[correct]
-    # общая улика бывает у двух зверей (копытные), поэтому добавляем ещё и
-    # решающую — вместе они указывают ровно на одного
-    clues = [random.choice(info["shared"]), random.choice(info["unique"])]
-    random.shuffle(clues)
-    clue_lines = "\n".join(f"• {html.escape(c)}" for c in clues)
-    return f"<pre>{html.escape(info['art'])}</pre>\n🔎 Улики:\n{clue_lines}"
-
-
-def tracks_guide_text() -> str:
-    parts = ["🐾 <b>КАК ЧИТАТЬ СЛЕДЫ</b>"]
-    icons = {"заяц": "🐇 Заяц", "олень": "🦌 Олень", "кабан": "🐗 Кабан"}
-    for key, info in TRACK_INFO.items():
-        parts.append(f"\n{icons[key]}\n<pre>{html.escape(info['art'])}</pre>")
-        parts.extend(f"• {html.escape(c)}" for c in info["unique"][:2])
-    parts.append("\nКопытные (олень и кабан) похожи размером — смотрите на форму копыта и боковые пальцы.")
-    return "\n".join(parts)
-
-
-def activity_game_kb(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=label, callback_data=f"actgame_{key}_{user_id}")
-        for key, label in ANIMAL_TRACK_LABELS.items()
-    ]])
-
-
-async def _finalize_activity_result(pet: sqlite3.Row, won: bool | None, note_extra: str = ""):
-    """Начисляет добычу/опыт/вес по замороженному payload мини-игры "чей след?".
-    won=True — угадал (бонус), won=False — не угадал (без бонуса),
-    won=None — не ответил вовремя, результат забирается автоматически."""
-    user_id = pet["user_id"]
-    # БАГФИКС: защита от двойного зачёта (клик по кнопке + авто-таймаут одновременно)
-    if not claim_activity_game(user_id):
+async def _apply_activity_result(user_id: int, payload: dict):
+    """Начисляет добычу/опыт/вес за вернувшийся из леса/охоты питомец."""
+    pet = get_pet(user_id)
+    if pet is None:
         return
-    # и от устаревшего снимка: дальше работаем со свежей строкой из БД
-    pet = get_pet(user_id) or pet
-    payload = json.loads(pet["game_payload"])
     raw_meat_gain = payload["raw_meat_gain"]
     firewood_gain = payload["firewood_gain"]
     bones_gain = payload["bones_gain"]
@@ -5346,20 +5198,6 @@ async def _finalize_activity_result(pet: sqlite3.Row, won: bool | None, note_ext
     bones_spent = payload["bones_spent"]
     activity = payload["activity"]
 
-    game_note = ""
-    if won:
-        bonus_mult = 1 + GAME_WIN_LOOT_BONUS_PERCENT / 100
-        raw_meat_gain = round(raw_meat_gain * bonus_mult)
-        bones_gain = round(bones_gain * bonus_mult)
-        firewood_gain = round(firewood_gain * bonus_mult, 2)
-        xp_gain = int(xp_gain * bonus_mult)
-        weight_loss = round(weight_loss * GAME_WIN_WEIGHT_LOSS_MULT, 2)
-        game_note = f"\n🎯 След угадан верно! +{GAME_WIN_LOOT_BONUS_PERCENT}% к добыче и опыту, меньше усталости."
-    elif won is False:
-        game_note = "\n❌ След угадан неверно — бонуса нет, но добыча остаётся вашей."
-    else:
-        game_note = "\n⏰ Вы не успели ответить — результат забран автоматически, без бонуса."
-
     grant_pet_xp(pet, xp_gain)
     add_pet_resources(
         user_id,
@@ -5371,10 +5209,6 @@ async def _finalize_activity_result(pet: sqlite3.Row, won: bool | None, note_ext
         user_id,
         weight=max(1.0, pet["weight"] - weight_loss),
         satiety=new_satiety,
-        game_pending=0,
-        game_correct=None,
-        game_payload=None,
-        game_offered_at=None,
         pending_potion_loot=0,
     )
     if bones_gain:
@@ -5405,55 +5239,29 @@ async def _finalize_activity_result(pet: sqlite3.Row, won: bool | None, note_ext
         await bot.send_message(
             user_id,
             f"🐺 Ваш «{payload['pet_name']}» вернулся {label}!\n"
-            + "\n".join(gain_lines) + ambush_msg + game_note,
+            + "\n".join(gain_lines) + ambush_msg,
         )
     except Exception as e:
         log.warning("Не удалось уведомить пользователя %s: %s", user_id, e)
 
 
-@dp.message(F.text.func(lambda t: _normalize_ru(t) in {"следы", "следы в лесу"} if t else False))
-async def cmd_tracks_guide(message: Message):
-    await reply_or_send(message, tracks_guide_text(), parse_mode="HTML")
-
-
-@dp.callback_query(F.data.startswith("actgame_"))
-async def cb_activity_game_answer(callback: CallbackQuery):
-    rest = callback.data[len("actgame_"):]
-    choice, user_id_str = rest.rsplit("_", 1)
-    user_id = int(user_id_str)
-    if callback.from_user.id != user_id:
-        # двойная защита — то же самое уже проверяет owner_guard_middleware
-        await callback.answer("Это не ваша мини-игра!", show_alert=True)
-        return
-    pet = get_pet(user_id)
-    if pet is None or not pet["alive"] or not pet["game_pending"]:
-        await callback.answer("Эта мини-игра уже неактуальна.", show_alert=True)
-        return
-    won = choice == pet["game_correct"]
-    correct_label = ANIMAL_TRACK_LABELS.get(pet["game_correct"], pet["game_correct"])
-    await _finalize_activity_result(pet, won=won)
+async def settle_leftover_games():
+    """Одноразовая совместимость: мини-игра «Чей след?» удалена. Если у кого-то
+    она висела на момент обновления — доначисляем добычу похода (без бонуса),
+    чтобы ничего не пропало."""
     try:
-        await callback.message.edit_reply_markup(reply_markup=None)
+        rows = await _fetch_rows("SELECT * FROM pets WHERE game_pending=1")
     except Exception:
-        pass
-    await callback.answer("🎯 Верно!" if won else f"❌ Неверно, это был след: {correct_label}", show_alert=True)
-
-
-async def resolve_stale_activity_games():
-    """Если игрок не ответил на мини-игру "чей след?" за GAME_TIMEOUT_SECONDS —
-    результат похода забирается автоматически, без бонуса за угадывание."""
-    rows = await _fetch_rows("SELECT * FROM pets WHERE game_pending=1 AND alive=1")
-
-    now = datetime.utcnow()
-    tasks = []
+        return  # колонок нет — значит, и зависших игр нет
     for pet in rows:
-        offered_at = pet["game_offered_at"]
-        if not offered_at:
-            continue
-        if (now - datetime.fromisoformat(offered_at)).total_seconds() < GAME_TIMEOUT_SECONDS:
-            continue
-        tasks.append(_finalize_activity_result(pet, won=None))
-    await _bg_gather(tasks)
+        user_id = pet["user_id"]
+        try:
+            payload = json.loads(pet["game_payload"]) if pet["game_payload"] else None
+            update_pet(user_id, game_pending=0, game_correct=None, game_payload=None, game_offered_at=None)
+            if payload and pet["alive"]:
+                await _apply_activity_result(user_id, payload)
+        except Exception as e:
+            log.warning("Не удалось доначислить добычу %s: %s", user_id, e)
 
 
 async def resolve_finished_campfires():
@@ -5742,6 +5550,7 @@ async def global_error_handler(event):
 async def main():
     init_db()
     load_pending_users()
+    await settle_leftover_games()
     try:
         await _get_bot_id()
     except Exception as e:
