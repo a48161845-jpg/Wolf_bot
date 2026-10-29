@@ -785,20 +785,44 @@ def update_pet(user_id: int, **fields):
 _PET_RESOURCE_COLS = {"firewood", "raw_meat", "cooked_meat", "bones"}
 
 
-def add_pet_resources(user_id: int, min_required: dict | None = None, **deltas) -> bool:
+_IDENT_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+
+def add_pet_resources(user_id: int, min_required: dict | None = None,
+                      set_fields: dict | None = None, where_extra: str | None = None,
+                      **deltas) -> bool:
     """Атомарно меняет ресурсы питомца на дельты (могут быть отрицательными).
     min_required={"firewood": 0.25} — применять, только если на момент записи
-    ресурса хватает; возвращает False, если условие не выполнилось."""
+    ресурса хватает; возвращает False, если условие не выполнилось.
+    set_fields — другие колонки, которые нужно выставить В ТОЙ ЖЕ команде (так
+    возврат из похода — лут + освобождение питомца — либо применяется целиком,
+    либо не применяется вообще). where_extra — доп. условие (SQL без параметров)."""
     for col in deltas:
         if col not in _PET_RESOURCE_COLS:
             raise ValueError(f"недопустимая колонка ресурса: {col}")
-    if not deltas:
+    set_fields = set_fields or {}
+    for col in set_fields:
+        if not _IDENT_RE.match(col):
+            raise ValueError(f"недопустимая колонка: {col}")
+    if not deltas and not set_fields:
         return True
-    sets = ", ".join(
-        f"{c}=ROUND(COALESCE({c},0)+?, 2)" if c == "firewood" else f"{c}=COALESCE({c},0)+?"
-        for c in deltas
-    )
-    where, params = ["user_id=?"], [*deltas.values(), user_id]
+    # БАГФИКС (Postgres): ROUND(real, 2) в Postgres не существует (только для
+    # numeric) — команда падала, и лут из леса не начислялся. CAST AS NUMERIC
+    # работает и в Postgres, и в SQLite.
+    set_parts, params = [], []
+    for c, v in deltas.items():
+        if c == "firewood":
+            set_parts.append(f"{c}=ROUND(CAST(COALESCE({c},0)+? AS NUMERIC), 2)")
+        else:
+            set_parts.append(f"{c}=COALESCE({c},0)+?")
+        params.append(v)
+    for c, v in set_fields.items():
+        set_parts.append(f"{c}=?")
+        params.append(v)
+    sets = ", ".join(set_parts)
+    where, params = ["user_id=?"], [*params, user_id]
+    if where_extra:
+        where.append(where_extra)
     for col, need in (min_required or {}).items():
         if col not in _PET_RESOURCE_COLS:
             raise ValueError(f"недопустимая колонка ресурса: {col}")
@@ -919,6 +943,14 @@ def create_new_pet(user_id: int, name: str):
         busy_until=None,
         busy_activity=None,
         cooking_until=None,
+        # сбрасываем хвосты от прошлого питомца (бой/арена/зелья/совместный поход)
+        in_arena=0,
+        fight_opponent_id=None,
+        fight_is_attacker=0,
+        joint_activity_bonus=0,
+        pending_potion_strength=0,
+        pending_potion_speed=0,
+        pending_potion_loot=0,
     )
 
 
@@ -1085,20 +1117,31 @@ def grant_skin_ownership(user_id: int, skin_name: str):
     )
     conn.commit()
     conn.close()
-RING_COST_DOLLARS = 200
+RING_COST_DOLLARS = 100  # было 200 — по запросу цена кольца снижена вдвое
 ANTITARGET_PRICES = {"1 день": (1, 15), "3 дня": (3, 35), "7 дней": (7, 70)}
 PREFIX_PRICES = {"1 день": (1, 10), "3 дня": (3, 25), "7 дней": (7, 55)}
 
 # Лабиринт — упрощён: меньше шагов, больше допустимых ошибок, приз скромнее, без колец
 MAZE_KEY_COST = 1
-MAZE_STEPS_TO_WIN = 6
-MAZE_MAX_MISTAKES = 4
+MAZE_STEPS_TO_WIN = 7
+MAZE_MAX_MISTAKES = 3          # «жизни»: после 3-й ошибки лабиринт провален
 MAZE_DIRECTIONS = ["left", "straight", "right"]
 MAZE_DIRECTION_LABELS = {"left": "⬅️ Влево", "straight": "⬆️ Прямо", "right": "➡️ Вправо"}
-MAZE_WIN_RUNES = 8
-# По запросу: доллары теперь даются только за бонус и лабиринт (и немного за квесты)
-MAZE_WIN_DOLLARS_MIN, MAZE_WIN_DOLLARS_MAX = 1, 10
-# по запросу: очень редкий шанс найти ларец прямо в лабиринте (см. cb_maze_move)
+# по запросу (улучшение лабиринта): на каждом шаге есть ПОДСКАЗКА, но она верна
+# лишь с шансом MAZE_HINT_TRUTH_CHANCE; после ошибки верный путь меняется (перебором
+# не пройти); за верные шаги иногда находится бонус; приз случаен; даже при
+# провале за пройденный путь дают утешительные руны.
+MAZE_HINT_TRUTH_CHANCE = 0.75
+MAZE_HINT_TEXT = {
+    "left": "🌬 Слева тянет свежим воздухом",
+    "straight": "👣 Прямо слышны отзвуки шагов",
+    "right": "🕯 Справа мерцает слабый свет",
+}
+MAZE_WIN_RUNES_MIN, MAZE_WIN_RUNES_MAX = 8, 14
+MAZE_STEP_BONUS_CHANCE = 0.15
+MAZE_STEP_BONUS_RUNES_MIN, MAZE_STEP_BONUS_RUNES_MAX = 1, 2
+MAZE_CONSOLATION_STEPS_PER_RUNE = 3   # провал: +1 🀄 за каждые 3 пройденных шага
+# по запросу: доллары за лабиринт не даются (только руны/ларец)
 MAZE_LARETS_DROP_CHANCE = 0.03
 
 # =========================================================
@@ -1179,6 +1222,28 @@ def apply_satiety_decay(pet: sqlite3.Row) -> int:
     return max(0, pet["satiety"] - decay)
 
 
+def satiety_state(pet: sqlite3.Row) -> tuple[int, str]:
+    """Возвращает (актуальная сытость, новая точка отсчёта last_fed) — их нужно
+    записывать В БАЗУ ВМЕСТЕ.
+
+    БАГФИКС: раньше в базу писали уже "уменьшенную" сытость, а last_fed не
+    трогали — при следующем открытии меню убыль считалась ВТОРОЙ раз от той же
+    давней точки (двойной счёт), и волки голодали гораздо быстрее, чем задумано.
+    Точку отсчёта сдвигаем ровно на «съеденное» время (а не ставим 'сейчас'),
+    чтобы дробные части процента не пропадали — иначе частое открытие меню
+    полностью останавливало бы голод."""
+    now = datetime.utcnow()
+    if not pet["last_fed"]:
+        return pet["satiety"], now.isoformat()
+    last_fed = datetime.fromisoformat(pet["last_fed"])
+    hours = max(0.0, (now - last_fed).total_seconds() / 3600)
+    decay = int(hours * SATIETY_DECAY_PER_HOUR)
+    if decay <= 0:
+        return pet["satiety"], pet["last_fed"]
+    new_anchor = last_fed + timedelta(hours=decay / SATIETY_DECAY_PER_HOUR)
+    return max(0, pet["satiety"] - decay), new_anchor.isoformat()
+
+
 async def reply_or_send(message: Message, text: str, **kwargs):
     """По запросу: все ответы пользователю теперь отправляются реплаем на его
     сообщение (в группе сразу видно, кому и на что отвечает бот). Если реплай
@@ -1191,9 +1256,11 @@ async def reply_or_send(message: Message, text: str, **kwargs):
 
 
 def pet_is_busy(pet: sqlite3.Row) -> bool:
-    if not pet["busy_until"]:
-        return False
-    return datetime.utcnow() < datetime.fromisoformat(pet["busy_until"])
+    # БАГФИКС: питомец считается занятым, пока фоновый цикл не «закрыл» поход
+    # (busy_until сброшен и добыча начислена). Раньше за ~30 секунд между
+    # временем возврата и обработкой можно было отправить волка в новый поход —
+    # busy_activity перезаписывалась, и добыча за прошлый поход пропадала.
+    return bool(pet["busy_until"])
 
 
 def fmt_timedelta(td: timedelta) -> str:
@@ -1407,7 +1474,6 @@ def profile_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🎯 Квесты", callback_data="quests"),
         ],
         [InlineKeyboardButton(text="🔑 Лабиринт", callback_data="maze")],
-        [InlineKeyboardButton(text="🎁 Ларец", callback_data="larets_screen")],
         [InlineKeyboardButton(text="🏪 Магазин", callback_data="shop")],
     ])
 
@@ -1433,26 +1499,22 @@ def pet_menu_kb(busy: bool, pet: sqlite3.Row | None = None) -> InlineKeyboardMar
             InlineKeyboardButton(text="🎭 Скин", callback_data="skin_menu"),
             InlineKeyboardButton(text="⚔️ Арена", callback_data="arena"),
         ],
-        [InlineKeyboardButton(text="🧪 Зелья", callback_data="potions_menu")],
         [InlineKeyboardButton(text=f"✏️ Сменить имя ({RENAME_COST_RUNES}🀄)", callback_data="rename")],
         [InlineKeyboardButton(text="⬅ Назад в профиль", callback_data="back_profile")],
     ])
 
 
 def pet_skins_kb(user_id: int, current_skin: str | None = None) -> InlineKeyboardMarkup:
-    # кнопка текущего надетого скина сразу помечается галочкой
+    # по запросу: во вкладке скинов питомца показываются ТОЛЬКО уже купленные
+    # (или выданные) скины; купить новые можно в магазине. Текущий — с галочкой.
     owned = get_owned_skins(user_id)
     rows = []
-    for name, price in SKINS.items():
-        if name == current_skin:
-            label = f"✅ {name} (надето)"
-        elif name in owned:
-            label = f"🐺 {name} (надеть)"
-        else:
-            label = f"{name} — {price}💵 (купить)"
+    for name in SKINS:
+        if name not in owned:
+            continue
+        label = f"✅ {name} (надето)" if name == current_skin else f"🐺 {name} (надеть)"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buy_skin_{name}")])
-    # по запросу: кастомные скины (выданные админом/из ларца через стикер) —
-    # их нет в магазине, показываем только если реально есть в собственности
+    # кастомные скины (выданные админом / из ларца) — тоже только если есть в собственности
     for name in get_all_custom_skin_names(user_id):
         label = f"✅ {name} (надето)" if name == current_skin else f"🎭 {name} (надеть)"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"buy_skin_{name}")])
@@ -1478,7 +1540,8 @@ def arena_kb(opponents: list[sqlite3.Row], in_arena: bool = False) -> InlineKeyb
 
 
 def campfire_kb(user_id: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="🔥 Готовить мясо", callback_data="campfire_cook")]]
+    rows = [[InlineKeyboardButton(text="🔥 Готовить мясо", callback_data="campfire_cook"),
+             InlineKeyboardButton(text="🔄 Обновить", callback_data="campfire")]]
     if get_potion_count(user_id, "cooking") > 0:
         rows.append([InlineKeyboardButton(
             text=f"🧪 Зелье жарки (мгновенно, 1🥩→{POTION_COOKING_OUTPUT}🍖)",
@@ -1656,6 +1719,11 @@ def campfire_text(pet: sqlite3.Row) -> str:
         if datetime.utcnow() < until:
             remaining = until - datetime.utcnow()
             lines.append(f"\n♨️ Жаровня: мясо жарится (осталось {fmt_timedelta(remaining)})")
+        else:
+            lines.append("\n♨️ Мясо уже прожарилось — сейчас окажется в инвентаре.")
+    else:
+        lines.append(f"\nНа 1 порцию: {CAMPFIRE_MEAT_COST} 🥩 и от {CAMPFIRE_WOOD_COST_MIN} до "
+                     f"{CAMPFIRE_WOOD_COST_MAX:g} 🪵 (случайно). Жарится {fmt_timedelta(timedelta(seconds=CAMPFIRE_COOK_SECONDS))}.")
     return "\n".join(lines)
 
 
@@ -1779,11 +1847,12 @@ async def send_pet_screen(chat_id: int, user_id: int, edit_message: Message | No
 
     # сытость (и, соответственно, риск голодной смерти) считается всегда,
     # вне зависимости от занятости питомца
-    satiety_now = apply_satiety_decay(pet)
+    satiety_now, new_anchor = satiety_state(pet)
     if satiety_now > 0:
-        update_pet(user_id, satiety=satiety_now, starved_since=None)
+        update_pet(user_id, satiety=satiety_now, last_fed=new_anchor, starved_since=None)
     else:
-        update_pet(user_id, satiety=satiety_now, starved_since=pet["starved_since"] or datetime.utcnow().isoformat())
+        update_pet(user_id, satiety=satiety_now, last_fed=new_anchor,
+                   starved_since=pet["starved_since"] or datetime.utcnow().isoformat())
     pet = get_pet(user_id)
 
     caption = pet_text(pet, satiety_now) + busy_note
@@ -3155,8 +3224,13 @@ async def cb_revive(callback: CallbackQuery):
     # навсегда оставался истощённым и слабым на арене (боевая мощь зависит от веса),
     # а набрать вес обратно кормлением (+0.1-0.3 кг за раз) было практически нереально.
     # Теперь воскрешение возвращает вес к стартовому значению нового питомца.
+    # last_fed обязательно обновляем: иначе убыль сытости считалась бы от момента
+    # смерти (дни назад) и воскрешённый волк тут же снова умирал бы от голода
     update_pet(u.id, alive=1, satiety=50, weight=PET_DEFAULT_WEIGHT, starved_since=None,
-               busy_until=None, busy_activity=None)
+               last_fed=datetime.utcnow().isoformat(),
+               busy_until=None, busy_activity=None, cooking_until=None,
+               joint_activity_bonus=0, pending_potion_speed=0, pending_potion_loot=0,
+               pending_potion_strength=0)
     await reply_or_send(callback.message, 
         f"✨ «{pet['name']}» восстал из мертвых и снова с вами! Вес восстановлен до {PET_DEFAULT_WEIGHT:.1f} кг."
     )
@@ -3238,7 +3312,7 @@ async def _start_activity_for_user(user_id: int, activity_key: str, chat_id: int
     if pet_is_busy(pet):
         return None
 
-    satiety_now = apply_satiety_decay(pet)
+    satiety_now, satiety_anchor = satiety_state(pet)
     duration = random.randint(min_sec, max_sec)
     if joint:
         # вместе с партнёром волк возвращается быстрее
@@ -3252,6 +3326,7 @@ async def _start_activity_for_user(user_id: int, activity_key: str, chat_id: int
     update_pet(
         user_id,
         satiety=satiety_now,
+        last_fed=satiety_anchor,
         busy_until=busy_until.isoformat(),
         busy_activity=activity_key,
         joint_activity_bonus=1 if joint else 0,
@@ -3489,6 +3564,14 @@ async def cb_joint_activity_yes(callback: CallbackQuery):
     activity_key, proposer_id_str = rest.rsplit("_", 1)
     proposer_id = int(proposer_id_str)
     u = callback.from_user
+
+    # проверяем ОБОИХ заранее, чтобы не получилось, что один уже ушёл, а второй нет
+    pet_a, pet_b = get_pet(proposer_id), get_pet(u.id)
+    if (pet_a is None or not pet_a["alive"] or pet_is_busy(pet_a)
+            or pet_b is None or not pet_b["alive"] or pet_is_busy(pet_b)):
+        await callback.message.edit_text("Не получилось отправиться вместе — у кого-то из вас питомец занят или мёртв.")
+        await callback.answer()
+        return
 
     text_a = await _start_activity_for_user(proposer_id, activity_key, chat_id=proposer_id, joint=True)
     text_b = await _start_activity_for_user(u.id, activity_key, joint=True)
@@ -3744,6 +3827,12 @@ async def resolve_fight_challenge_timeout(attacker: sqlite3.Row):
             pass
 
 
+def _sat_after_loss(pet: sqlite3.Row, loss: int) -> dict:
+    """Поля сытости после траты `loss`% (с корректным сдвигом last_fed — см. satiety_state)."""
+    sat, anchor = satiety_state(pet)
+    return {"satiety": max(0, sat - loss), "last_fed": anchor}
+
+
 async def resolve_wolf_fight(attacker: sqlite3.Row):
     """Вызывается фоновым циклом, когда 30-минутный бой завершился."""
     attacker_id = attacker["user_id"]
@@ -3769,10 +3858,10 @@ async def resolve_wolf_fight(attacker: sqlite3.Row):
     if attacker_wins:
         bones_won = random.randint(2, 6)
         xp_won = random.randint(10, 25)
-        update_pet(attacker_id, satiety=max(0, apply_satiety_decay(attacker) - sat_loss_a),
+        update_pet(attacker_id, **_sat_after_loss(attacker, sat_loss_a),
                    bones=attacker["bones"] + bones_won, busy_until=None, busy_activity=None,
                    fight_opponent_id=None, fight_is_attacker=0, in_arena=0, pending_potion_strength=0)
-        update_pet(defender_id, satiety=max(0, apply_satiety_decay(defender) - sat_loss_b),
+        update_pet(defender_id, **_sat_after_loss(defender, sat_loss_b),
                    busy_until=None, busy_activity=None, fight_opponent_id=None, fight_is_attacker=0, in_arena=0,
                    pending_potion_strength=0)
         grant_pet_xp(get_pet(attacker_id), xp_won)
@@ -3781,10 +3870,10 @@ async def resolve_wolf_fight(attacker: sqlite3.Row):
                     f"+{bones_won} 🦴, +{xp_won} ✨ опыта питомцу")
         lose_text = f"⚔️ Ваш «{defender['name']}» проиграл бой волку «{attacker['name']}»! Сытость -{sat_loss_b}%"
     else:
-        update_pet(attacker_id, satiety=max(0, apply_satiety_decay(attacker) - sat_loss_a),
+        update_pet(attacker_id, **_sat_after_loss(attacker, sat_loss_a),
                    busy_until=None, busy_activity=None, fight_opponent_id=None, fight_is_attacker=0, in_arena=0,
                    pending_potion_strength=0)
-        update_pet(defender_id, satiety=max(0, apply_satiety_decay(defender) - sat_loss_b),
+        update_pet(defender_id, **_sat_after_loss(defender, sat_loss_b),
                    busy_until=None, busy_activity=None, fight_opponent_id=None, fight_is_attacker=0, in_arena=0,
                    pending_potion_strength=0)
         record_quest_progress(defender_id, "win_fight", 1)
@@ -3812,6 +3901,8 @@ async def cb_campfire(callback: CallbackQuery):
     if pet is None or not pet["alive"]:
         await callback.answer("Сначала приручите волка", show_alert=True)
         return
+    if collect_campfire(u.id):
+        pet = get_pet(u.id)  # готовое мясо уже выдано — показываем свежие цифры
     await safe_edit_or_send(callback.message, campfire_text(pet), campfire_kb(u.id), owner_id=callback.from_user.id)
     await callback.answer()
 
@@ -3825,7 +3916,10 @@ async def cmd_campfire_text(message: Message):
     if pet is None or not pet["alive"]:
         await reply_or_send(message, "Сначала приручите волка (команда «волк»).")
         return
-    await safe_edit_or_send(message, campfire_text(pet), campfire_kb(u.id), owner_id=u.id)
+    if collect_campfire(u.id):
+        pet = get_pet(u.id)
+    sent = await reply_or_send(message, campfire_text(pet), reply_markup=campfire_kb(u.id))
+    remember_owner(sent.chat.id, sent.message_id, u.id)
 
 
 @dp.callback_query(F.data == "campfire_cook")
@@ -3835,7 +3929,12 @@ async def cb_campfire_cook(callback: CallbackQuery):
     if pet is None or not pet["alive"]:
         await callback.answer("Сначала приручите волка", show_alert=True)
         return
-    if pet["cooking_until"] and datetime.utcnow() < datetime.fromisoformat(pet["cooking_until"]):
+    # БАГФИКС: если прошлая порция уже дожарилась, но фоновый цикл ещё не успел её
+    # выдать, раньше новая готовка перезаписывала таймер — и порция пропадала.
+    # Теперь сперва забираем готовое.
+    if collect_campfire(u.id):
+        pet = get_pet(u.id)
+    if pet["cooking_until"]:
         await callback.answer("Мясо уже готовится на костре", show_alert=True)
         return
     # БАГФИКС: раньше остаток дров < 0.25 был "мёртвым" — его нельзя было потратить.
@@ -3852,17 +3951,20 @@ async def cb_campfire_cook(callback: CallbackQuery):
     # но не больше, чем реально есть у игрока
     wood_cost = round(min(random.uniform(CAMPFIRE_WOOD_COST_MIN, CAMPFIRE_WOOD_COST_MAX), pet["firewood"]), 2)
     wood_cost = max(wood_cost, CAMPFIRE_WOOD_MIN_TO_COOK)
-    # атомарное списание: если за это время ресурсы ушли (двойной клик/передача) — не готовим
+    # БАГФИКС: списание ресурсов и запуск таймера теперь ОДНОЙ атомарной командой.
+    # Раньше двойной клик списывал мясо и дрова дважды (а порция запускалась одна),
+    # а сбой между списанием и таймером «съедал» ресурсы без результата.
+    cooking_until = datetime.utcnow() + timedelta(seconds=CAMPFIRE_COOK_SECONDS)
     if not add_pet_resources(
         u.id,
         min_required={"firewood": max(0.0, wood_cost - 0.005), "raw_meat": CAMPFIRE_MEAT_COST},
+        where_extra="cooking_until IS NULL",
+        set_fields={"cooking_until": cooking_until.isoformat()},
         firewood=-wood_cost,
         raw_meat=-CAMPFIRE_MEAT_COST,
     ):
-        await callback.answer("Не хватает ресурсов!", show_alert=True)
+        await callback.answer("Не получилось: костёр уже занят или не хватает ресурсов.", show_alert=True)
         return
-    cooking_until = datetime.utcnow() + timedelta(seconds=CAMPFIRE_COOK_SECONDS)
-    update_pet(u.id, cooking_until=cooking_until.isoformat())
     # уведомление всплывающим сообщением сверху экрана, без флуда в чате
     await callback.answer(
         f"🔥 Костёр разожжён! Потрачено {wood_cost:.2f} 🪵 дров. "
@@ -3887,8 +3989,12 @@ async def cb_campfire_potion_cook(callback: CallbackQuery):
     if pet["raw_meat"] < 1:
         await callback.answer("Нет сырого мяса для готовки.", show_alert=True)
         return
+    # сперва атомарно забираем мясо (с проверкой остатка), и только потом списываем зелье —
+    # иначе при сбое/двойном клике зелье сгорало бы впустую
+    if not add_pet_resources(u.id, min_required={"raw_meat": 1}, raw_meat=-1, cooked_meat=POTION_COOKING_OUTPUT):
+        await callback.answer("Нет сырого мяса для готовки.", show_alert=True)
+        return
     add_potion(u.id, "cooking", -1)
-    add_pet_resources(u.id, raw_meat=-1, cooked_meat=POTION_COOKING_OUTPUT)
     record_quest_progress(u.id, "cook_meat", POTION_COOKING_OUTPUT)
     await callback.answer(
         f"🧪🔥 Зелье жарки использовано! Мгновенно получено {POTION_COOKING_OUTPUT} 🍖 готового мяса, дрова не потрачены.",
@@ -3934,26 +4040,64 @@ async def cb_gift(callback: CallbackQuery):
 
 
 # =========================================================
-#  ЛАБИРИНТ — усложнённая версия
-#  Нужно 10 верных шагов подряд по прогрессу (макс. 3 ошибки), приз крупный
+#  ЛАБИРИНТ — 7 шагов, 3 жизни, подсказки (не всегда верные), случайный приз
 # =========================================================
 
 def maze_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=MAZE_DIRECTION_LABELS["left"], callback_data="maze_left"),
-        InlineKeyboardButton(text=MAZE_DIRECTION_LABELS["straight"], callback_data="maze_straight"),
-        InlineKeyboardButton(text=MAZE_DIRECTION_LABELS["right"], callback_data="maze_right"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=MAZE_DIRECTION_LABELS["left"], callback_data="maze_left"),
+            InlineKeyboardButton(text=MAZE_DIRECTION_LABELS["straight"], callback_data="maze_straight"),
+            InlineKeyboardButton(text=MAZE_DIRECTION_LABELS["right"], callback_data="maze_right"),
+        ],
+        [InlineKeyboardButton(text="🏳 Сдаться", callback_data="maze_quit")],
+    ])
 
 
-def maze_step_text(progress: int, mistakes: int) -> str:
-    return (
-        "🔑 ЛАБИРИНТ\n"
-        "————————————\n"
-        f"Пройдено шагов: {progress}/{MAZE_STEPS_TO_WIN}\n"
-        f"Ошибок: {mistakes}/{MAZE_MAX_MISTAKES}\n\n"
-        "Куда пойдёт ваш волк?"
-    )
+def _maze_roll_step() -> str:
+    """Новый шаг лабиринта: верное направление + направление подсказки (подсказка
+    честная с шансом MAZE_HINT_TRUTH_CHANCE). Хранится в maze_correct как 'верное|подсказка'."""
+    correct = random.choice(MAZE_DIRECTIONS)
+    if random.random() < MAZE_HINT_TRUTH_CHANCE:
+        hint = correct
+    else:
+        hint = random.choice([d for d in MAZE_DIRECTIONS if d != correct])
+    return f"{correct}|{hint}"
+
+
+def _maze_parse_step(value: str | None) -> tuple[str, str]:
+    """(верное направление, направление подсказки); старый формат без '|' тоже понимаем."""
+    if not value:
+        value = _maze_roll_step()
+    if "|" in value:
+        correct, hint = value.split("|", 1)
+    else:
+        correct = hint = value
+    if correct not in MAZE_DIRECTIONS:
+        correct = random.choice(MAZE_DIRECTIONS)
+    if hint not in MAZE_DIRECTIONS:
+        hint = correct
+    return correct, hint
+
+
+def maze_step_text(progress: int, mistakes: int, hint: str | None = None, note: str = "") -> str:
+    path = "🟩" * progress + "⬜" * max(0, MAZE_STEPS_TO_WIN - progress)
+    lives = "❤️" * max(0, MAZE_MAX_MISTAKES - mistakes) + "🖤" * mistakes
+    lines = [
+        "🔑 ЛАБИРИНТ",
+        "————————————",
+        f"Путь: {path}  ({progress}/{MAZE_STEPS_TO_WIN})",
+        f"Жизни: {lives}",
+        "",
+    ]
+    if note:
+        lines.extend([note, ""])
+    if hint:
+        lines.append(f"💡 {MAZE_HINT_TEXT[hint]}")
+        lines.append("(подсказка не всегда верна)")
+        lines.append("")
+    lines.append("Куда пойдёт ваш волк?")
+    return "\n".join(lines)
 
 
 @dp.callback_query(F.data == "maze")
@@ -3961,26 +4105,47 @@ async def cb_maze(callback: CallbackQuery):
     u = callback.from_user
     user = get_or_create_user(u.id, u.username or "", u.full_name)
     if user["maze_active"]:
+        _, hint = _maze_parse_step(user["maze_correct"])
         await safe_edit_or_send(
             callback.message,
-            maze_step_text(user["maze_progress"], user["maze_mistakes"]),
+            maze_step_text(user["maze_progress"], user["maze_mistakes"], hint),
             maze_kb(),
-        owner_id=callback.from_user.id)
+            owner_id=u.id)
         await callback.answer()
         return
     if user["keys"] < MAZE_KEY_COST:
         await callback.answer(f"Нужен хотя бы {MAZE_KEY_COST} ключ(а) 🔑", show_alert=True)
         return
-    correct = random.choice(MAZE_DIRECTIONS)
+    step = _maze_roll_step()
     update_user(
         u.id,
         keys=user["keys"] - MAZE_KEY_COST,
         maze_active=1,
         maze_progress=0,
         maze_mistakes=0,
-        maze_correct=correct,
+        maze_correct=step,
     )
-    await safe_edit_or_send(callback.message, maze_step_text(0, 0), maze_kb(), owner_id=callback.from_user.id)
+    _, hint = _maze_parse_step(step)
+    await safe_edit_or_send(callback.message, maze_step_text(0, 0, hint), maze_kb(), owner_id=u.id)
+    await callback.answer()
+
+
+def _maze_reset(user_id: int):
+    update_user(user_id, maze_active=0, maze_progress=0, maze_mistakes=0, maze_correct=None)
+
+
+@dp.callback_query(F.data == "maze_quit")
+async def cb_maze_quit(callback: CallbackQuery):
+    u = callback.from_user
+    user = get_or_create_user(u.id, u.username or "", u.full_name)
+    if not user["maze_active"]:
+        await callback.answer("Лабиринт уже закончен.", show_alert=True)
+        return
+    _maze_reset(u.id)
+    await safe_edit_or_send(
+        callback.message,
+        "🏳 Вы покинули лабиринт. Ключ потрачен — в следующий раз повезёт больше!",
+        None, owner_id=u.id)
     await callback.answer()
 
 
@@ -3993,7 +4158,7 @@ async def cb_maze_move(callback: CallbackQuery):
         return
 
     chosen = callback.data.split("_", 1)[1]
-    correct = user["maze_correct"]
+    correct, _old_hint = _maze_parse_step(user["maze_correct"])
     progress = user["maze_progress"]
     mistakes = user["maze_mistakes"]
     was_correct = chosen == correct
@@ -4004,14 +4169,13 @@ async def cb_maze_move(callback: CallbackQuery):
         mistakes += 1
 
     if progress >= MAZE_STEPS_TO_WIN:
-        # по запросу: доллары за лабиринт больше не даются
-        maze_reward = dict(runes=MAZE_WIN_RUNES)
-        update_user(u.id, maze_active=0, maze_progress=0, maze_mistakes=0, maze_correct=None)
+        win_runes = random.randint(MAZE_WIN_RUNES_MIN, MAZE_WIN_RUNES_MAX)
+        maze_reward = dict(runes=win_runes)
+        _maze_reset(u.id)
         grant_rewards(u.id, **maze_reward)
         # по запросу: очень редкий шанс найти ларец прямо в лабиринте
-        found_larets = random.random() < MAZE_LARETS_DROP_CHANCE
         extra_line = ""
-        if found_larets:
+        if random.random() < MAZE_LARETS_DROP_CHANCE:
             fresh = get_or_create_user(u.id, "", "")
             update_user(u.id, larets=fresh["larets"] + 1)
             extra_line = "\n\n🎁 Невероятная удача — среди стен лабиринта вы нашли ЛАРЕЦ!"
@@ -4019,30 +4183,41 @@ async def cb_maze_move(callback: CallbackQuery):
             callback.message,
             "🎉 ЛАБИРИНТ ПРОЙДЕН!\n\nВы нашли выход и главный приз:\n"
             f"🏆 {_reward_str(maze_reward)}" + extra_line,
-            None,
-        owner_id=callback.from_user.id)
+            None, owner_id=u.id)
         await callback.answer()
         return
 
     if mistakes >= MAZE_MAX_MISTAKES:
-        update_user(u.id, maze_active=0, maze_progress=0, maze_mistakes=0, maze_correct=None)
+        _maze_reset(u.id)
+        consolation = progress // MAZE_CONSOLATION_STEPS_PER_RUNE
+        if consolation:
+            grant_rewards(u.id, runes=consolation)
         await safe_edit_or_send(
             callback.message,
-            f"💀 Лабиринт провален — слишком много ошибок ({MAZE_MAX_MISTAKES}/{MAZE_MAX_MISTAKES}).\n"
-            "Попробуйте ещё раз позже!",
-            None,
-        owner_id=callback.from_user.id)
+            f"💀 Лабиринт провален — жизни закончились (пройдено шагов: {progress}/{MAZE_STEPS_TO_WIN}).\n"
+            + (f"Утешительный приз за пройденный путь: +{consolation} 🀄\n" if consolation else "")
+            + "Попробуйте ещё раз!",
+            None, owner_id=u.id)
         await callback.answer()
         return
 
-    # при ошибке верное направление НЕ меняется, чтобы игрок мог
-    # спокойно перебрать оставшиеся варианты; новое направление выбирается
-    # только после того, как шаг пройден верно.
-    next_correct = random.choice(MAZE_DIRECTIONS) if was_correct else correct
-    update_user(u.id, maze_progress=progress, maze_mistakes=mistakes, maze_correct=next_correct)
-    note = "✅ Верно!" if was_correct else "❌ Ошибка! Путь не изменился — попробуйте другое направление."
-    await callback.answer(note)
-    await safe_edit_or_send(callback.message, maze_step_text(progress, mistakes), maze_kb(), owner_id=callback.from_user.id)
+    # после КАЖДОГО шага (и верного, и ошибочного) верный путь выбирается заново —
+    # перебором все три направления подряд пройти нельзя, нужно думать над подсказкой
+    next_step = _maze_roll_step()
+    _, next_hint = _maze_parse_step(next_step)
+    update_user(u.id, maze_progress=progress, maze_mistakes=mistakes, maze_correct=next_step)
+
+    if was_correct:
+        note = "✅ Верно! Вы продвинулись вперёд."
+        if random.random() < MAZE_STEP_BONUS_CHANCE:
+            bonus = random.randint(MAZE_STEP_BONUS_RUNES_MIN, MAZE_STEP_BONUS_RUNES_MAX)
+            grant_rewards(u.id, runes=bonus)
+            note += f"\n✨ По пути найдено +{bonus} 🀄"
+    else:
+        note = "❌ Тупик! Вы потеряли жизнь, а проходы изменились."
+    await callback.answer("✅ Верно!" if was_correct else "❌ Ошибка!")
+    await safe_edit_or_send(callback.message, maze_step_text(progress, mistakes, next_hint, note),
+                            maze_kb(), owner_id=u.id)
 
 
 # =========================================================
@@ -4127,9 +4302,20 @@ async def cb_larets_open(callback: CallbackQuery):
     await callback.answer()
 
 
+_LARETS_PICKED: set[tuple[int, int]] = set()
+
+
 @dp.callback_query(F.data.startswith("larpick_"))
 async def cb_larets_pick(callback: CallbackQuery):
     u = callback.from_user
+    # БАГФИКС: двойной быстрый тап по ячейке выдавал ДВА приза за один ларец
+    pick_key = (callback.message.chat.id, callback.message.message_id)
+    if pick_key in _LARETS_PICKED:
+        await callback.answer()
+        return
+    _LARETS_PICKED.add(pick_key)
+    if len(_LARETS_PICKED) > 5000:
+        _LARETS_PICKED.clear()
     prize = random.choices(LARETS_PRIZES, weights=[p["weight"] for p in LARETS_PRIZES], k=1)[0]
     grant = prize["grant"]
 
@@ -4167,7 +4353,8 @@ async def cmd_shop_text(message: Message):
     # по запросу: команду "магазин" теперь можно писать прямо в чат
     u = message.from_user
     get_or_create_user(u.id, u.username or "", u.full_name)
-    await safe_edit_or_send(message, "🏪 Магазин — выберите раздел:", shop_main_kb(), owner_id=u.id)
+    sent = await reply_or_send(message, "🏪 Магазин — выберите раздел:", reply_markup=shop_main_kb())
+    remember_owner(sent.chat.id, sent.message_id, u.id)
 
 
 @dp.callback_query(F.data == "shop_prefix")
@@ -4206,7 +4393,7 @@ async def cb_skin_menu(callback: CallbackQuery):
         return
     await safe_edit_or_send(
         callback.message,
-        f"🎭 Скины питомца (сейчас: «{pet['skin']}»):",
+        f"🎭 Ваши скины (сейчас: «{pet['skin']}»).\nНовые скины можно купить в 🏪 Магазине → 🐺 Скины.",
         pet_skins_kb(u.id, pet["skin"]),
     owner_id=callback.from_user.id)
     await callback.answer()
@@ -4992,9 +5179,14 @@ async def cb_req_send(callback: CallbackQuery):
 async def background_loop():
     while True:
         await asyncio.sleep(30)
-        await resolve_finished_activities()
-        await resolve_finished_campfires()
-        await check_starvation_deaths()
+        # БАГФИКС: каждый шаг в своём try/except. Раньше любая ошибка (обрыв
+        # соединения с БД, баг в одной записи) молча убивала весь фоновый цикл —
+        # и после этого НИКОМУ не приходила добыча из леса/охоты до перезапуска.
+        for step in (resolve_finished_activities, resolve_finished_campfires, check_starvation_deaths):
+            try:
+                await step()
+            except Exception as e:
+                log.error("Фоновый шаг %s упал: %s", step.__name__, e, exc_info=True)
 
 
 # БАГФИКС (скорость запуска): раньше все накопившиеся уведомления (лес/охота/
@@ -5052,12 +5244,20 @@ async def resolve_finished_activities():
             # чтобы не обработать одну и ту же схватку дважды
             if pet["fight_is_attacker"]:
                 tasks.append(resolve_wolf_fight(pet))
+            elif now - until > timedelta(minutes=10):
+                # страховка: если запись атакующего пропала, защитник не должен
+                # остаться «занятым» навсегда
+                update_pet(pet["user_id"], busy_until=None, busy_activity=None,
+                           fight_opponent_id=None, fight_is_attacker=0, pending_potion_strength=0)
             continue
         if pet["busy_activity"] == FIGHT_CHALLENGE_ACTIVITY:
             # вызов на бой не был принят вовремя — сгорает (обрабатываем один раз,
             # тоже по записи атакующего)
             if pet["fight_is_attacker"]:
                 tasks.append(resolve_fight_challenge_timeout(pet))
+            elif now - until > timedelta(minutes=10):
+                update_pet(pet["user_id"], busy_until=None, busy_activity=None,
+                           fight_opponent_id=None, fight_is_attacker=0)
             continue
         tasks.append(resolve_activity(pet))
     await _bg_gather(tasks)
@@ -5066,7 +5266,9 @@ async def resolve_finished_activities():
 async def resolve_activity(pet: sqlite3.Row):
     user_id = pet["user_id"]
     activity = pet["busy_activity"] or "лес"
-    satiety = pet["satiety"]
+    # актуальная сытость с учётом убыли за время похода (раньше брали устаревшее
+    # значение из базы, из-за чего штраф за голод считался неверно)
+    satiety, satiety_anchor = satiety_state(pet)
 
     if activity == "охота":
         # добычи стало меньше
@@ -5169,19 +5371,23 @@ async def resolve_activity(pet: sqlite3.Row):
         "dollars_gain": dollars_gain,
         "weight_loss": weight_loss,
         "new_satiety": new_satiety,
+        "satiety_anchor": satiety_anchor,
         "used_loot_potion": used_loot_potion,
         "low_satiety": low_satiety,
         "ambush_msg": ambush_msg,
         "bones_spent": bones_spent,
         "pet_name": pet["name"],
     }
-    # сначала освобождаем питомца, затем начисляем добычу
-    update_pet(user_id, busy_until=None, busy_activity=None, joint_activity_bonus=0)
     await _apply_activity_result(user_id, payload)
 
 
 async def _apply_activity_result(user_id: int, payload: dict):
-    """Начисляет добычу/опыт/вес за вернувшийся из леса/охоты питомец."""
+    """Начисляет добычу/вес/сытость И освобождает питомца ОДНОЙ атомарной командой
+    в базе: либо всё записалось, либо ничего (тогда поход остаётся «открытым» и
+    фоновый цикл попробует ещё раз). Раньше питомца освобождали первым шагом, и
+    если следующая запись падала (например, из-за ошибки БД), добыча терялась
+    навсегда. Выдать добычу дважды тоже нельзя: условие busy_until IS NOT NULL
+    срабатывает только один раз."""
     pet = get_pet(user_id)
     if pet is None:
         return
@@ -5198,19 +5404,26 @@ async def _apply_activity_result(user_id: int, payload: dict):
     bones_spent = payload["bones_spent"]
     activity = payload["activity"]
 
-    grant_pet_xp(pet, xp_gain)
-    add_pet_resources(
+    applied = add_pet_resources(
         user_id,
+        where_extra="busy_until IS NOT NULL",
+        set_fields=dict(
+            weight=max(1.0, pet["weight"] - weight_loss),
+            satiety=new_satiety,
+            last_fed=payload.get("satiety_anchor") or datetime.utcnow().isoformat(),
+            busy_until=None,
+            busy_activity=None,
+            joint_activity_bonus=0,
+            pending_potion_loot=0,
+        ),
         firewood=firewood_gain,
         raw_meat=raw_meat_gain,
         bones=bones_gain - bones_spent,
     )
-    update_pet(
-        user_id,
-        weight=max(1.0, pet["weight"] - weight_loss),
-        satiety=new_satiety,
-        pending_potion_loot=0,
-    )
+    if not applied:
+        return  # этот поход уже закрыт (другим проходом цикла)
+
+    grant_pet_xp(get_pet(user_id), xp_gain)
     if bones_gain:
         record_quest_progress(user_id, "collect_bones_5", bones_gain)
     if dollars_gain:
@@ -5245,39 +5458,35 @@ async def _apply_activity_result(user_id: int, payload: dict):
         log.warning("Не удалось уведомить пользователя %s: %s", user_id, e)
 
 
-async def settle_leftover_games():
-    """Одноразовая совместимость: мини-игра «Чей след?» удалена. Если у кого-то
-    она висела на момент обновления — доначисляем добычу похода (без бонуса),
-    чтобы ничего не пропало."""
-    try:
-        rows = await _fetch_rows("SELECT * FROM pets WHERE game_pending=1")
-    except Exception:
-        return  # колонок нет — значит, и зависших игр нет
-    for pet in rows:
-        user_id = pet["user_id"]
-        try:
-            payload = json.loads(pet["game_payload"]) if pet["game_payload"] else None
-            update_pet(user_id, game_pending=0, game_correct=None, game_payload=None, game_offered_at=None)
-            if payload and pet["alive"]:
-                await _apply_activity_result(user_id, payload)
-        except Exception as e:
-            log.warning("Не удалось доначислить добычу %s: %s", user_id, e)
+def collect_campfire(user_id: int) -> int:
+    """Если мясо на костре дожарилось — атомарно выдаёт его и освобождает костёр.
+    Возвращает число порций (0 — ничего не готово). Безопасно звать откуда угодно
+    (фоновый цикл, открытие костра, нажатие «Готовить»): повторно выдать нельзя."""
+    pet = get_pet(user_id)
+    if pet is None or not pet["cooking_until"]:
+        return 0
+    if datetime.utcnow() < datetime.fromisoformat(pet["cooking_until"]):
+        return 0
+    output = random.randint(CAMPFIRE_MEAT_OUTPUT_MIN, CAMPFIRE_MEAT_OUTPUT_MAX)
+    if not add_pet_resources(user_id, cooked_meat=output,
+                             set_fields={"cooking_until": None},
+                             where_extra="cooking_until IS NOT NULL"):
+        return 0
+    record_quest_progress(user_id, "cook_meat", output)
+    return output
 
 
 async def resolve_finished_campfires():
-    rows = await _fetch_rows("SELECT * FROM pets WHERE cooking_until IS NOT NULL")
+    rows = await _fetch_rows("SELECT user_id, cooking_until FROM pets WHERE cooking_until IS NOT NULL")
 
     now = datetime.utcnow()
     tasks = []
     for pet in rows:
-        until = datetime.fromisoformat(pet["cooking_until"])
-        if now < until:
+        if now < datetime.fromisoformat(pet["cooking_until"]):
             continue
-        output = random.randint(CAMPFIRE_MEAT_OUTPUT_MIN, CAMPFIRE_MEAT_OUTPUT_MAX)
-        add_pet_resources(pet["user_id"], cooked_meat=output)
-        update_pet(pet["user_id"], cooking_until=None)
-        record_quest_progress(pet["user_id"], "cook_meat", output)
-        tasks.append(_notify_campfire_ready(pet["user_id"], output))
+        output = collect_campfire(pet["user_id"])
+        if output:
+            tasks.append(_notify_campfire_ready(pet["user_id"], output))
     await _bg_gather(tasks)
 
 
@@ -5301,7 +5510,13 @@ async def check_starvation_deaths():
             update_pet(pet["user_id"], starved_since=now.isoformat())
             continue
         started = datetime.fromisoformat(pet["starved_since"])
-        grace = timedelta(seconds=random.randint(STARVE_GRACE_MIN_SEC, STARVE_GRACE_MAX_SEC))
+        # БАГФИКС: раньше срок «отсрочки» перебрасывался случайно на КАЖДОМ проходе
+        # цикла (раз в 30 сек), и волк умирал почти сразу после минимума (≈48ч),
+        # а не в случайный момент между 48 и 96 часами. Теперь срок для конкретной
+        # голодовки один и тот же (зависит от игрока и момента начала голода).
+        grace_sec = random.Random(f"{pet['user_id']}|{pet['starved_since']}").randint(
+            STARVE_GRACE_MIN_SEC, STARVE_GRACE_MAX_SEC)
+        grace = timedelta(seconds=grace_sec)
         if now - started < grace:
             continue
         update_pet(pet["user_id"], alive=0, busy_until=None, busy_activity=None)
@@ -5550,7 +5765,6 @@ async def global_error_handler(event):
 async def main():
     init_db()
     load_pending_users()
-    await settle_leftover_games()
     try:
         await _get_bot_id()
     except Exception as e:
